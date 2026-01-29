@@ -1,0 +1,158 @@
+# =============================================================================
+# DATOS - NUNCA SUBIR DATOS AL REPOSITORIO
+# =============================================================================
+data/**/*.csv
+data/**/*.pkl
+data/**/*.pickle
+data/**/*.parquet
+data/**/*.xlsx
+data/**/*.xls
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.gif
+
+# Mantener la estructura de carpetas vacías
+!data/.gitkeep
+!data/**/.gitkeep
+
+# =============================================================================
+# PYTHON
+# =============================================================================
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Entorno virtual
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Distribuciones y builds
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# =============================================================================
+# IDE - EDITORES
+# =============================================================================
+# VS Code
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+.swp
+.swo
+*~
+
+# =============================================================================
+# ARCHIVOS DEL SISTEMA OPERATIVO
+# =============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+
+# =============================================================================
+# LOGS
+# =============================================================================
+logs/
+*.log
+*.out
+*.err
+
+# =============================================================================
+# JUPYTER
+# =============================================================================
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Archivos temporales de Jupyter
+.jupyter/
+.jupyterlab-settings/
+
+# =============================================================================
+# ARCHIVOS TEMPORALES
+# =============================================================================
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.~*
+
+# =============================================================================
+# ARCHIVOS PERSONALES (NO USAR ESTOS NOMBRES)
+# =============================================================================
+test_*.py
+sandbox/
+scratch/
+personal/
+
+# =============================================================================
+# HPC / SLURM
+# =============================================================================
+*.srun
+slurm-*.out
+slurm-*.err
+
+# =============================================================================
+# ARCHIVOS QUE SI INCLUIR (excepciones)
+# =============================================================================
+# Asegurate de que los archivos importantes NO se ignoren:
+# - .gitkeep (para mantener directorios)
+# - *.md (documentación)
+# - *.py (código Python)
+# - *.sh (scripts shell)
+# - *.ipynb (notebooks)
+# - requirements.txt, pyproject.toml, setup.py
+# - .gitignore, .github/
+
+# Si necesitas subir un archivo que está en la lista:
+# git add -f archivo
