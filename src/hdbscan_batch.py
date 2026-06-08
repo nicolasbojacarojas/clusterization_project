@@ -13,7 +13,6 @@ from astropy import units as u
 import seaborn as sns
 import plotly.express as px
 import matplotlib.pyplot as plt
-from collections import defaultdict
 import random
 from joblib import Parallel, delayed
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -132,76 +131,85 @@ def perturbar_variables(df):
 ######### Funcion que se encarga de aplicar hdbscan #########
     
 def procesar_muestra(df, min_pts, max_pts, contador):
-
-    print(f"[DEBUG] Iniciando clustering HDBSCAN en iteración {contador}")
     # definimos hdbscan con los parametros ajustados
     hdb = HDBSCAN(min_cluster_size=min_pts, max_cluster_size=max_pts)
-    # nombre de las colummnas normalizadas
+    # nombre de las columnas normalizadas
     columnas_norm = [f"{v}_norm" for v in VARIABLES_CLUSTER]
     # paso por el algoritmo de hdbscan
-    hdb.fit(df[columnas_norm])
+    hdb.fit(df[columnas_norm].values)
+    
     # asignamos las etiquetas de los grupos
     etiquetas = hdb.labels_
     # imprimimos el numero de clusters encontrados aislando el ruido
     n_clusters = len(set(etiquetas)) - (1 if -1 in etiquetas else 0)
-    print(f"[DEBUG] Clustering terminado. Clusters encontrados: {n_clusters}")
+    
     # incluimos los valores de probabilidades
     probabilidades = hdb.probabilities_
     # seleccionamos los clusters validos al aislar el ruido
     valid_labels = set(etiquetas[etiquetas != -1])
     
-    # lista que almacena los resultados de clusterizacion
-    resultados = []
-    # bucle para empezar a poblar la lista
-    for idx, sid, etq, prob in zip(df.index, df.source_id, etiquetas, probabilidades):
-        # validacion sobre clusters encontrados y validos
-        if etq in valid_labels:
-            resultados.append((idx, sid, prob))
+    if not valid_labels:
+        return []
+    
+    # Usar numpy para operaciones más rápidas
+    indices = df.index.values
+    source_ids = df['source_id'].values
+    
+    # Filtrar solo los registros en clusters válidos
+    mask = np.isin(etiquetas, list(valid_labels))
+    
+    resultados = [
+        (idx, sid, prob) 
+        for idx, sid, prob in zip(indices[mask], source_ids[mask], probabilidades[mask])
+    ]
     return resultados
     
 ######### Funcion para actualizar los resultados #########        
-def actualizar_datos_acumulados(datos_id, resultados):
-    # bucle para poblar con los resultados que se obtienen
+def actualizar_datos_acumulados(datos_arrays, resultados):
+    """Actualiza arrays numpy con resultados de clustering (más eficiente para 100k-1M registros)."""
     for idx, sid, prob in resultados:
-        datos_id[idx]["source_id"] = sid
-        datos_id[idx]["conteo"] += 1
-        datos_id[idx]["sum_probs"] += prob
-        datos_id[idx]["count_probs"] += 1
+        datos_arrays['source_id'][idx] = sid
+        datos_arrays['conteo'][idx] += 1
+        datos_arrays['sum_probs'][idx] += prob
+        datos_arrays['count_probs'][idx] += 1
         
-######### Funcion que genera un dataframe a partir de un diccionario #########
+######### Funcion que genera un dataframe a partir de arrays numpy #########
         
-def construir_dataframe_conteo(datos_id, df_base, contador):
-    print(f"[INFO] Construyendo DataFrame de resultados para iteración {contador}")
-    # creacion y poblacion del dataframe
+def construir_dataframe_conteo(datos_arrays, df_base, contador):
+    """Construye DataFrame desde arrays numpy (optimizado para 100k-1M registros)."""
+    
+    # Calcular MediaProbabilidad directamente con numpy
+    media_prob = np.divide(
+        datos_arrays['sum_probs'], 
+        datos_arrays['count_probs'],
+        where=(datos_arrays['count_probs'] > 0),
+        out=np.zeros_like(datos_arrays['sum_probs'], dtype=np.float32)
+    )
+    
     df_conteo = pd.DataFrame({
-        "ID": list(datos_id.keys()),
-        "source_id": [datos["source_id"] for datos in datos_id.values()],
-        "MediaProbabilidad": [datos["sum_probs"] / datos["count_probs"] if datos["count_probs"] > 0 else 0 for datos in datos_id.values()],
-        "ConteoAgrupaciones": [datos["conteo"] for datos in datos_id.values()],
-        "PresenteEnMuestras": [datos["presente"] for datos in datos_id.values()]
+        "source_id": datos_arrays['source_id'],
+        "MediaProbabilidad": media_prob,
+        "ConteoAgrupaciones": datos_arrays['conteo'],
+        "PresenteEnMuestras": datos_arrays['presente']
     })
-    # union de los resultados con el dataframe inicial
-    df_final = df_base.reset_index().merge(df_conteo, how='inner', on='source_id')
+    
+    # Merge más eficiente: usar merge on index
+    df_final = df_base.reset_index(drop=True).copy()
+    df_final = pd.concat([df_final, df_conteo], axis=1)
+    
     df_final['iteraciones'] = contador
-    print(f"[INFO] Registros acumulados hasta ahora: {len(df_final)}")
+    media_presente = datos_arrays['presente'].mean()
+    print(f"[INFO] Registros: {len(df_final)} | Media presencia: {media_presente:.1f} muestras")
+    
     return df_final
     
 ######### Funcion que divide el dataset en muestras de 10 con el 80 porciento de los datos #########
-    
-def procesar_lote(df_base, min_pts, max_pts, contador, n_muestras, n_cpus):
-    # ideal para procesamiento con slurm para usar los 10 nucleos
-    print(f"[INFO] Procesando lote {contador} con {n_muestras} muestras en paralelo ({n_cpus} núcleos)")
-    # muestreo con el 80 porciento de los datos en total n_muestras dataframes nuevos
-    muestras = [df_base.sample(frac=0.8) for _ in range(n_muestras)]
-    # paralelizamos la ejecucion sobre cada n_cpus
-    resultados = Parallel(n_jobs=n_cpus)(
-        delayed(procesar_muestra)(m, min_pts, max_pts, contador) for m in muestras
-    )
-    return resultados
 
-######## Funcion que en lugar de hacer el muestreo, perturba las variables 
-    
 def procesar_lote(df_base, min_pts, max_pts, contador, n_muestras, n_cpus, modo="combinado"):
+    """
+    Procesa un lote con perturbación, muestreo o combinación.
+    Retorna tupla (resultados_clustering, muestras_source_ids)
+    """
     print(f"[INFO] Procesando lote {contador} | Modo: {modo} | Muestras: {n_muestras} | Núcleos: {n_cpus}")
 
     def perturbar(df):
@@ -215,6 +223,8 @@ def procesar_lote(df_base, min_pts, max_pts, contador, n_muestras, n_cpus, modo=
         return df_pert
 
     muestras = []
+    muestras_indices = []  # Para rastrear los índices originales
+    
     for _ in range(n_muestras):
         if modo == "muestreo":
             muestra = df_base.sample(frac=0.8)
@@ -224,109 +234,192 @@ def procesar_lote(df_base, min_pts, max_pts, contador, n_muestras, n_cpus, modo=
             muestra = perturbar(df_base.sample(frac=0.8))
         else:
             raise ValueError(f"[ERROR] Modo desconocido: {modo}")
+        
         muestras.append(muestra)
+        muestras_indices.append(set(muestra.index.values))  # Guardar índices presentes
 
     # Normalización por muestra
     scaler = PercentileMinMaxScaler(lower=0.05, upper=0.95)
     for i in range(len(muestras)):
-        cols_original = VARIABLES_CLUSTER
-        cols_norm = [f"{v}_norm" for v in cols_original]
-        muestras[i][cols_norm] = scaler.fit_transform(muestras[i][cols_original])
+        cols_norm = [f"{v}_norm" for v in VARIABLES_CLUSTER]
+        muestras[i][cols_norm] = scaler.fit_transform(muestras[i][VARIABLES_CLUSTER])
 
     resultados = Parallel(n_jobs=n_cpus)(
         delayed(procesar_muestra)(m, min_pts, max_pts, contador) for m in muestras
     )
 
-    return resultados
+    return resultados, muestras_indices
 
+######### Funcion para construir dataframe final con razón de exclusión #########
+
+def construir_resultado_final(df_completo, df_procesado, indices_removidos_iqr, indices_removidos_bloque_pequeño):
+    """
+    Construye dataframe final incluyendo registros no procesados con razón de exclusión.
+    """
+    # Asegurar que df_procesado tiene índices
+    df_procesado = df_procesado.copy()
+    df_procesado['razon_exclusion'] = 'Procesado'
     
-# def procesar_lote(df_base, min_pts, max_pts, contador, n_muestras, n_cpus):
-#     print(f"[INFO] Procesando lote {contador} con {n_muestras} muestras en paralelo ({n_cpus} núcleos)")
-#     muestras = [df_base.sample(frac=0.8) for _ in range(n_muestras)]
-#     resultados = Parallel(n_jobs=n_cpus)(
-#         delayed(procesar_muestra)(m, min_pts, max_pts, contador) for m in muestras
-#     )
-#     # También regresamos los source_id de las muestras
-#     muestras_ids = [set(m['source_id']) for m in muestras]
-#     return resultados, muestras_ids
-
+    # Identificar registros no procesados
+    indices_procesados = set(df_procesado.index)
+    
+    # Dataframe para excluidos
+    registros_excluidos = []
+    
+    # Registros removidos por IQR
+    for idx in indices_removidos_iqr:
+        if idx in df_completo.index:
+            fila = df_completo.loc[idx].copy()
+            fila['razon_exclusion'] = 'Removido por IQR (error relativo alto)'
+            fila['ConteoAgrupaciones'] = 0
+            fila['PresenteEnMuestras'] = 0
+            fila['MediaProbabilidad'] = 0.0
+            registros_excluidos.append(fila)
+    
+    # Registros en bloques pequeños
+    for idx in indices_removidos_bloque_pequeño:
+        if idx in df_completo.index:
+            fila = df_completo.loc[idx].copy()
+            fila['razon_exclusion'] = 'Bloque muy pequeño (< 40 registros)'
+            fila['ConteoAgrupaciones'] = 0
+            fila['PresenteEnMuestras'] = 0
+            fila['MediaProbabilidad'] = 0.0
+            registros_excluidos.append(fila)
+    
+    # Combinar procesados y excluidos
+    if registros_excluidos:
+        df_excluidos = pd.DataFrame(registros_excluidos)
+        df_final = pd.concat([df_procesado, df_excluidos], ignore_index=False)
+    else:
+        df_final = df_procesado.copy()
+    
+    # Asegurar columna razon_exclusion existe
+    if 'razon_exclusion' not in df_final.columns:
+        df_final['razon_exclusion'] = 'Procesado'
+    
 ######### Funcion main para ejecutar #########    
 def main():
     df_completo = pd.read_csv(str(GAIA_PARALLAX5_10))
-    df_completo['parallax_over_error'] = df_completo['parallax']/df_completo['parallax_error']
-    df_completo['pmra_over_error'] = df_completo['pmra']/df_completo['pmra_error']
-    df_completo['pmdec_over_error'] = df_completo['pmdec']/df_completo['pmdec_error']
-    df_completo['ra_over_error'] = df_completo['ra']/df_completo['ra_error']
-    df_completo['dec_over_error'] = df_completo['dec']/df_completo['dec_error']
-    df_completo['ra_relative_error'] = abs(df_completo['ra_error']/df_completo['ra'])
-    df_completo['dec_relative_error'] = abs(df_completo['dec_error']/df_completo['dec'])
-    df_completo['pmra_relative_error'] = abs(df_completo['pmra_error']/df_completo['pmra'])
-    df_completo['pmdec_relative_error'] = abs(df_completo['pmdec_error']/df_completo['pmdec'])
-    df_completo['parallax_relative_error'] = abs(df_completo['parallax_error']/df_completo['parallax'])
-    print(len(df_completo))
-    df_completo = eliminar_outliers_iqr(df_completo, ['ra_relative_error','dec_relative_error','pmra_relative_error','pmdec_relative_error','parallax_relative_error'])
-    print(len(df_completo))
-    bloques = dividir_por_cuadros(df_completo, tam_ra=60, tam_dec=60)
+    df_completo_backup = df_completo.copy()  # Backup para rastrear exclusiones
     
+    # Rastrear índices originales
+    indices_originales = set(df_completo.index)
+    
+    # Vectorización: calcular errores relativos de una vez
+    error_cols = ['ra', 'dec', 'pmra', 'pmdec', 'parallax']
+    for col in error_cols:
+        df_completo[f'{col}_relative_error'] = np.abs(df_completo[f'{col}_error'] / df_completo[col])
+    
+    print(f"[INFO] Registros iniciales: {len(df_completo)}")
+    
+    # Filtrar outliers IQR y rastrear removidos
+    df_filtrado = eliminar_outliers_iqr(df_completo, ['ra_relative_error','dec_relative_error','pmra_relative_error','pmdec_relative_error','parallax_relative_error'])
+    indices_removidos_iqr = indices_originales - set(df_filtrado.index)
+    print(f"[INFO] Registros tras IQR: {len(df_filtrado)} (removidos: {len(indices_removidos_iqr)})")
+    
+    bloques = dividir_por_cuadros(df_filtrado, tam_ra=60, tam_dec=60)
+    
+    # Rastrear registros en bloques pequeños
+    indices_en_bloques = set()
+    for ra_min, dec_min, df_bloque in bloques:
+        indices_en_bloques.update(df_bloque.index)
+    
+    indices_removidos_bloque_pequeño = set(df_filtrado.index) - indices_en_bloques
+    print(f"[INFO] Registros en bloques procesables: {len(indices_en_bloques)} (bloques pequeños: {len(indices_removidos_bloque_pequeño)})")
 
     min_pts = 40
     max_pts = 1500
     n_muestras = 10
     n_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", 4))
+    
+    # Dataframe para acumular resultados procesados
+    lista_datos_procesados = []
 
     for ra_min, dec_min, df_bloque in bloques:
-        print(f"\n[RA: {ra_min}° - {ra_min+60}°, DEC: {dec_min}° - {dec_min+60}°]\n longitud de {len(df_bloque)}")
+        n_records = len(df_bloque)
+        print(f"\n[RA: {ra_min}°-{ra_min+60}°, DEC: {dec_min}°-{dec_min+60}°] Registros: {n_records}")
         
-        if len(df_bloque) < min_pts:
-            print(f"[WARN] Bloque muy pequeño. Se omite.")
+        if n_records < min_pts:
+            print(f"[WARN] Bloque omitido (demasiado pequeño)")
             continue
 
         # Normalización local por bloque
         scaler = PercentileMinMaxScaler(lower=0.05, upper=0.95)
-        cols_original = VARIABLES_CLUSTER
-        cols_norm = [f"{v}_norm" for v in cols_original]
-        df_bloque[cols_norm] = scaler.fit_transform(df_bloque[cols_original])
+        cols_norm = [f"{v}_norm" for v in VARIABLES_CLUSTER]
+        df_bloque[cols_norm] = scaler.fit_transform(df_bloque[VARIABLES_CLUSTER])
 
-        # datos_id = defaultdict(lambda: {"source_id": 0, "sum_probs": 0, "count_probs": 0, "conteo": 0})
-        datos_id = defaultdict(lambda: {"source_id": 0, "sum_probs": 0, "count_probs": 0, "conteo": 0, "presente": 0})
+        # Inicializar arrays numpy para mejor rendimiento con 100k-1M registros
+        n_records = len(df_bloque)
+        datos_arrays = {
+            'source_id': np.zeros(n_records, dtype=np.int64),
+            'conteo': np.zeros(n_records, dtype=np.int16),
+            'presente': np.zeros(n_records, dtype=np.int16),
+            'sum_probs': np.zeros(n_records, dtype=np.float32),
+            'count_probs': np.zeros(n_records, dtype=np.int16)
+        }
+        
+        # Pre-poblar source_id desde df_bloque
+        datos_arrays['source_id'] = df_bloque['source_id'].values.copy()
 
         lista_datos = []
 
         for contador in range(1, 41):
-            resultados_lote = procesar_lote(
-                                                df_bloque, 
-                                                min_pts, 
-                                                max_pts, 
-                                                contador, 
-                                                n_muestras, 
-                                                n_cpus,
-                                                modo="combinado"  # o "muestreo" o "perturbacion"
-                                            )
+            resultados_lote, muestras_indices = procesar_lote(df_bloque, min_pts, max_pts, contador, n_muestras, n_cpus, modo="combinado")
 
-            for resultado in resultados_lote:
-                actualizar_datos_acumulados(datos_id, resultado)
-            df_final = construir_dataframe_conteo(datos_id, df_bloque, contador)
+            # Actualizar con resultados de clustering y presencia en muestras
+            for resultado, indices_presentes in zip(resultados_lote, muestras_indices):
+                # Primero actualizar presencia (índices están en un set)
+                for idx in indices_presentes:
+                    datos_arrays['presente'][idx] += 1
+                
+                # Luego actualizar agrupaciones
+                actualizar_datos_acumulados(datos_arrays, resultado)
             
-            # resultados_lote, muestras_ids = procesar_lote(df_bloque, min_pts, max_pts, contador, n_muestras, n_cpus)
-
-            # for ids_muestra in muestras_ids:
-            #   for sid in ids_muestra:
-            #     idx = df_bloque[df_bloque['source_id'] == sid].index
-            #     for i in idx:
-            #       datos_id[i]["source_id"] = sid
-            #       datos_id[i]["presente"] += 1
-            # df_final = construir_dataframe_conteo(datos_id, df_bloque, contador)
+            df_final = construir_dataframe_conteo(datos_arrays, df_bloque, contador)
+            
             ensure_dir_exists(DATOS_RESULTADOS)
             output_prev = DATOS_RESULTADOS / f"hdbscan_ra{ra_min}_dec{dec_min}_prev.csv"
             df_final.to_csv(str(output_prev), index=False)
             lista_datos.append(df_final)
 
-        df_master = pd.concat(lista_datos)
+        # Concatenar y guardar con copy=False para optimizar memoria
+        df_master = pd.concat(lista_datos, ignore_index=True, copy=False)
         ensure_dir_exists(DATOS_RESULTADOS)
         output_master = DATOS_RESULTADOS / f"hdbscan_ra{ra_min}_dec{dec_min}.csv"
         df_master.to_csv(str(output_master), index=False)
-
-    print("\n[FINALIZADO] Todos los bloques procesados.")
+        
+        # Acumular para resultado final global
+        lista_datos_procesados.append(df_master)
+        
+        # Limpiar memoria explícitamente
+        del df_master, lista_datos, datos_arrays, df_bloque
+        
+    # Construir resultado final con razones de exclusión
+    if lista_datos_procesados:
+        df_procesado_global = pd.concat(lista_datos_procesados, ignore_index=False, copy=False)
+    else:
+        df_procesado_global = pd.DataFrame()
+    
+    # Agregar razones de exclusión
+    df_resultado_final = construir_resultado_final(
+        df_completo_backup, 
+        df_procesado_global, 
+        indices_removidos_iqr, 
+        indices_removidos_bloque_pequeño
+    )
+    
+    # Guardar resultado final combinado
+    ensure_dir_exists(DATOS_RESULTADOS)
+    output_final = DATOS_RESULTADOS / "hdbscan_resultado_final_completo.csv"
+    df_resultado_final.to_csv(str(output_final), index=False)
+    
+    print(f"\n[INFO] RESUMEN FINAL:")
+    print(f"  - Registros iniciales: {len(df_completo_backup)}")
+    print(f"  - Removidos por IQR: {len(indices_removidos_iqr)}")
+    print(f"  - Removidos por bloque pequeño: {len(indices_removidos_bloque_pequeño)}")
+    print(f"  - Procesados: {len(df_procesado_global)}")
+    print(f"  - Total en resultado final: {len(df_resultado_final)}")
+    print(f"\n[FINALIZADO] Resultado guardado en: {output_final}")
 
 if __name__ == "__main__":
     main()
