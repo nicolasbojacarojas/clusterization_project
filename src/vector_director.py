@@ -521,48 +521,138 @@ def add_lambda_angle_from_apex(
     apex_vector: Optional[np.ndarray] = None,
     apex_l_deg: Optional[float] = None,
     apex_b_deg: Optional[float] = None,
-    x_col: str = "x_initial",
-    y_col: str = "y_initial",
-    z_col: str = "z_initial",
+    l_col: str = "l",
+    b_col: str = "b",
     copy: bool = True,
 ) -> pd.DataFrame:
-    validate_columns(df, [x_col, y_col, z_col])
+    """
+    Agrega el ángulo lambda entre cada estrella y el ápex.
+
+    Esta versión usa directamente trigonometría esférica:
+
+        cos(lambda) =
+            sin(b) sin(b_apex)
+            + cos(b) cos(b_apex) cos(l_apex - l)
+
+    y calcula lambda con:
+
+        lambda = atan2(sin(lambda), cos(lambda))
+
+    en vez de usar arccos directamente. Esto es más estable
+    numéricamente cerca del ápex y del antápex.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame de entrada. Debe contener coordenadas galácticas.
+
+    apex_vector : np.ndarray or None
+        Vector unitario del ápex en coordenadas galácticas cartesianas.
+        Si no se proporciona, deben pasarse `apex_l_deg` y `apex_b_deg`.
+
+    apex_l_deg : float or None
+        Longitud galáctica del ápex, en grados.
+
+    apex_b_deg : float or None
+        Latitud galáctica del ápex, en grados.
+
+    l_col : str, optional
+        Columna con longitud galáctica, en grados.
+
+    b_col : str, optional
+        Columna con latitud galáctica, en grados.
+
+    copy : bool, optional
+        Si True, devuelve una copia modificada.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame con columnas nuevas:
+
+        - lambda_rad
+        - lambda_deg
+        - sin_lambda
+        - cos_lambda
+        - delta_l_apex_rad
+        - delta_l_apex_deg
+        - lambda_tangent_l
+        - lambda_tangent_b
+    """
+
+    validate_columns(df, [l_col, b_col])
+
     result = df.copy() if copy else df
 
-    if apex_vector is None:
-        if apex_l_deg is None or apex_b_deg is None:
-            raise ValueError(
-                "You must provide either apex_vector or both "
-                "apex_l_deg and apex_b_deg."
-            )
-        apex_vector = galactic_lb_to_unit_vector(l_deg=apex_l_deg, b_deg=apex_b_deg)
+    if apex_vector is not None:
+        apex_coordinates = unit_vector_to_galactic_lb(apex_vector)
+        apex_l_deg = apex_coordinates["l_deg"]
+        apex_b_deg = apex_coordinates["b_deg"]
 
-    apex_vector = np.asarray(apex_vector, dtype=float)
-    if apex_vector.shape != (3,) or not np.isfinite(apex_vector).all():
-        raise ValueError("The apex vector is invalid.")
-
-    apex_norm = np.linalg.norm(apex_vector)
-    if apex_norm == 0.0:
-        raise ValueError("The apex vector has zero norm.")
-
-    apex_unit = apex_vector / apex_norm
-    star_vectors = result[[x_col, y_col, z_col]].to_numpy(dtype=float)
-    star_norms = np.linalg.norm(star_vectors, axis=1)
-    invalid_vectors = ~np.isfinite(star_vectors).all(axis=1) | (star_norms == 0.0)
-    if invalid_vectors.any():
+    if apex_l_deg is None or apex_b_deg is None:
         raise ValueError(
-            "Some stellar position vectors contain NaN, infinite values, "
-            "or have zero norm."
+            "You must provide either apex_vector or both "
+            "apex_l_deg and apex_b_deg."
         )
 
-    star_unit_vectors = star_vectors / star_norms[:, None]
-    cos_lambda = np.clip(star_unit_vectors @ apex_unit, -1.0, 1.0)
-    lambda_rad = np.arccos(cos_lambda)
+    l_rad = np.deg2rad(result[l_col].to_numpy(dtype=float))
+    b_rad = np.deg2rad(result[b_col].to_numpy(dtype=float))
+
+    apex_l_rad = np.deg2rad(float(apex_l_deg))
+    apex_b_rad = np.deg2rad(float(apex_b_deg))
+
+    delta_l_rad = apex_l_rad - l_rad
+    delta_l_rad = (delta_l_rad + np.pi) % (2.0 * np.pi) - np.pi
+
+    sin_b = np.sin(b_rad)
+    cos_b = np.cos(b_rad)
+
+    sin_b_apex = np.sin(apex_b_rad)
+    cos_b_apex = np.cos(apex_b_rad)
+
+    cos_delta_l = np.cos(delta_l_rad)
+    sin_delta_l = np.sin(delta_l_rad)
+
+    cos_lambda = (
+        sin_b * sin_b_apex
+        + cos_b * cos_b_apex * cos_delta_l
+    )
+    cos_lambda = np.clip(cos_lambda, -1.0, 1.0)
+
+    tangent_l_numerator = cos_b_apex * sin_delta_l
+    tangent_b_numerator = (
+        cos_b * sin_b_apex
+        - sin_b * cos_b_apex * cos_delta_l
+    )
+
+    sin_lambda = np.sqrt(
+        tangent_l_numerator**2 + tangent_b_numerator**2
+    )
+    sin_lambda = np.clip(sin_lambda, 0.0, 1.0)
+
+    lambda_rad = np.arctan2(sin_lambda, cos_lambda)
 
     result["lambda_rad"] = lambda_rad
-    result["lambda_deg"] = np.degrees(lambda_rad)
-    result["sin_lambda"] = np.sin(lambda_rad)
+    result["lambda_deg"] = np.rad2deg(lambda_rad)
+    result["sin_lambda"] = sin_lambda
     result["cos_lambda"] = cos_lambda
+
+    result["delta_l_apex_rad"] = delta_l_rad
+    result["delta_l_apex_deg"] = np.rad2deg(delta_l_rad)
+
+    valid_sin_lambda = sin_lambda > 1e-15
+
+    result["lambda_tangent_l"] = np.where(
+        valid_sin_lambda,
+        tangent_l_numerator / sin_lambda,
+        np.nan,
+    )
+
+    result["lambda_tangent_b"] = np.where(
+        valid_sin_lambda,
+        tangent_b_numerator / sin_lambda,
+        np.nan,
+    )
 
     return result
 
