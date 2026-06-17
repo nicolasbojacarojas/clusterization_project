@@ -1,34 +1,45 @@
 """Utilities for stellar apex analysis on a single cluster.
 
-This module extracts the core preprocessing and analysis steps from the
-notebook, but in a reusable Python library.
+Version ICRS / Gaia:
+    - Positions: ra, dec
+    - Proper motions: pmra, pmdec
+    - Gaia convention: pmra = mu_alpha* = mu_alpha cos(dec)
+
+This module implements the polar representation of the Convergent Point
+Method / Herschel method directly in equatorial coordinates, without
+transforming to Galactic coordinates.
 
 Example:
-    from src.vector_director import run_cluster_analysis
+    from vector_director_icrs import run_cluster_analysis
 
     result = run_cluster_analysis(
-        data_path="data/datos_resultados_modularizado/datos_clusterizados_todos_5d_f00.csv",
+        data_path="data/datos_clusterizados.csv",
         cluster_id="8_123",
     )
 
-    print(result["apex_result"])
+    print(result["cluster_result"]["apex_refined"])
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
-import astropy.units as u
 import numpy as np
 import pandas as pd
-from astropy.coordinates import SkyCoord
+
 
 MAS_TO_RAD = np.deg2rad(1.0 / 3_600_000.0)
+KM_S_PER_AU_YR = 4.74047
 
+
+# ============================================================
+# Basic utilities
+# ============================================================
 
 def validate_columns(df: pd.DataFrame, required_columns: Iterable[str]) -> None:
     missing_columns = set(required_columns).difference(df.columns)
+
     if missing_columns:
         raise ValueError(
             "Missing required columns: "
@@ -45,15 +56,26 @@ def create_cluster_id(
     division_col: str = "division",
     numeracion_col: str = "numeracion",
 ) -> pd.DataFrame:
+    """
+    Crea una columna cluster_id combinando el grupo de HDBSCAN/DBSCAN
+    con la división espacial usada en el barrido.
+
+    Por defecto usa coordenada_ra y coordenada_dec porque esas columnas
+    suelen representar la región o celda del cielo, no la RA/Dec real
+    de cada estrella.
+    """
+
     validate_columns(df, [group_col, ra_col, dec_col])
 
     result = df.copy()
+
     result[division_col] = (
         result[ra_col].astype(str) + "_" + result[dec_col].astype(str)
     )
 
     unique_divisions = pd.Index(result[division_col].unique())
     division_to_index = dict(zip(unique_divisions, range(len(unique_divisions))))
+
     result[numeracion_col] = result[division_col].map(division_to_index)
 
     result[cluster_col] = (
@@ -65,123 +87,120 @@ def create_cluster_id(
     return result
 
 
-def add_galactic_coordinates(
-    df: pd.DataFrame,
-    ra_col: str = "ra",
-    dec_col: str = "dec",
-    copy: bool = True,
-) -> pd.DataFrame:
-    validate_columns(df, [ra_col, dec_col])
-    result = df.copy() if copy else df
+# ============================================================
+# Equatorial / ICRS geometry
+# ============================================================
 
-    coords = SkyCoord(
-        ra=result[ra_col].to_numpy() * u.deg,
-        dec=result[dec_col].to_numpy() * u.deg,
-        frame="icrs",
+def equatorial_radec_to_unit_vector(
+    ra_deg: float,
+    dec_deg: float,
+) -> np.ndarray:
+    """
+    Convierte RA, Dec en grados a vector unitario cartesiano ICRS.
+    """
+
+    ra_rad = np.deg2rad(ra_deg)
+    dec_rad = np.deg2rad(dec_deg)
+
+    return np.array(
+        [
+            np.cos(dec_rad) * np.cos(ra_rad),
+            np.cos(dec_rad) * np.sin(ra_rad),
+            np.sin(dec_rad),
+        ],
+        dtype=float,
     )
-    galactic_coords = coords.galactic
-
-    result["l"] = galactic_coords.l.degree
-    result["b"] = galactic_coords.b.degree
-    result["l_rad"] = np.radians(result["l"].to_numpy() - 180.0)
-    result["b_rad"] = np.radians(result["b"].to_numpy())
-
-    return result
 
 
-def add_galactic_proper_motions(
+def unit_vector_to_equatorial_radec(vector: np.ndarray) -> Dict[str, float]:
+    """
+    Convierte vector cartesiano ICRS a RA, Dec.
+    """
+
+    vector = np.asarray(vector, dtype=float)
+    norm = np.linalg.norm(vector)
+
+    if norm == 0.0 or not np.isfinite(norm):
+        raise ValueError("Input vector has zero or invalid norm.")
+
+    x, y, z = vector / norm
+
+    ra_rad = np.arctan2(y, x) % (2.0 * np.pi)
+    dec_rad = np.arcsin(np.clip(z, -1.0, 1.0))
+
+    return {
+        "ra_deg": float(np.degrees(ra_rad)),
+        "dec_deg": float(np.degrees(dec_rad)),
+        "ra_rad": float(ra_rad),
+        "dec_rad": float(dec_rad),
+    }
+
+
+def add_initial_final_equatorial_vectors(
     df: pd.DataFrame,
     ra_col: str = "ra",
     dec_col: str = "dec",
     pmra_col: str = "pmra",
     pmdec_col: str = "pmdec",
-    copy: bool = True,
-    include_mu_l: bool = False,
-) -> pd.DataFrame:
-    required_columns = [ra_col, dec_col, pmra_col, pmdec_col]
-    validate_columns(df, required_columns)
-
-    result = df.copy() if copy else df
-
-    coords = SkyCoord(
-        ra=result[ra_col].to_numpy() * u.deg,
-        dec=result[dec_col].to_numpy() * u.deg,
-        pm_ra_cosdec=result[pmra_col].to_numpy() * u.mas / u.yr,
-        pm_dec=result[pmdec_col].to_numpy() * u.mas / u.yr,
-        frame="icrs",
-    )
-    galactic_coords = coords.galactic
-
-    result["pm_l_cosb"] = galactic_coords.pm_l_cosb.to_value(u.mas / u.yr)
-    result["pm_b"] = galactic_coords.pm_b.to_value(u.mas / u.yr)
-
-    if include_mu_l:
-        b_rad = galactic_coords.b.to_value(u.rad)
-        cos_b = np.cos(b_rad)
-        result["pm_l"] = np.where(
-            np.abs(cos_b) > 1e-12,
-            result["pm_l_cosb"].to_numpy() / cos_b,
-            np.nan,
-        )
-
-    return result
-
-
-def add_initial_final_galactic_vectors(
-    df: pd.DataFrame,
-    l_col: str = "l",
-    b_col: str = "b",
-    pm_l_col: str = "pm_l_cosb",
-    pm_b_col: str = "pm_b",
     time_years: float = 1.0,
     angles_in_degrees: bool = True,
-    pm_l_is_cosb: bool = True,
     copy: bool = True,
 ) -> pd.DataFrame:
-    validate_columns(df, [l_col, b_col, pm_l_col, pm_b_col])
+    """
+    Construye los vectores inicial y final sobre la esfera celeste usando
+    directamente coordenadas Gaia.
+
+    Gaia reporta:
+        pmra = mu_alpha* = mu_alpha cos(dec)
+
+    Por tanto, para desplazar la coordenada RA se usa:
+        delta_alpha = pmra / cos(dec)
+
+    pero para el módulo del movimiento propio se usa directamente:
+        mu_total = sqrt(pmra^2 + pmdec^2)
+    """
+
+    validate_columns(df, [ra_col, dec_col, pmra_col, pmdec_col])
+
     result = df.copy() if copy else df
 
     if angles_in_degrees:
-        l_rad = np.deg2rad(result[l_col].to_numpy(dtype=float))
-        b_rad = np.deg2rad(result[b_col].to_numpy(dtype=float))
+        ra_rad = np.deg2rad(result[ra_col].to_numpy(dtype=float))
+        dec_rad = np.deg2rad(result[dec_col].to_numpy(dtype=float))
     else:
-        l_rad = result[l_col].to_numpy(dtype=float)
-        b_rad = result[b_col].to_numpy(dtype=float)
+        ra_rad = result[ra_col].to_numpy(dtype=float)
+        dec_rad = result[dec_col].to_numpy(dtype=float)
 
-    pm_l_values = result[pm_l_col].to_numpy(dtype=float)
-    pm_b_values = result[pm_b_col].to_numpy(dtype=float)
-    cos_b = np.cos(b_rad)
+    pmra_values = result[pmra_col].to_numpy(dtype=float)
+    pmdec_values = result[pmdec_col].to_numpy(dtype=float)
 
-    if pm_l_is_cosb:
-        near_pole = np.abs(cos_b) < 1e-12
-        if near_pole.any():
-            raise ValueError(
-                "Some sources have cos(b) too close to zero. "
-                "Cannot safely compute mu_l = pm_l_cosb / cos(b)."
-            )
-        mu_l_masyr = pm_l_values / cos_b
-    else:
-        mu_l_masyr = pm_l_values
+    cos_dec = np.cos(dec_rad)
 
-    mu_b_masyr = pm_b_values
-    delta_l_rad = mu_l_masyr * MAS_TO_RAD * time_years
-    delta_b_rad = mu_b_masyr * MAS_TO_RAD * time_years
+    near_pole = np.abs(cos_dec) < 1e-12
+    if near_pole.any():
+        raise ValueError(
+            "Some sources have cos(dec) too close to zero. "
+            "Cannot safely compute delta_ra = pmra / cos(dec)."
+        )
 
-    l_final_rad = l_rad + delta_l_rad
-    b_final_rad = b_rad + delta_b_rad
+    delta_ra_rad = (pmra_values / cos_dec) * MAS_TO_RAD * time_years
+    delta_dec_rad = pmdec_values * MAS_TO_RAD * time_years
 
-    result["x_initial"] = np.cos(l_rad) * np.cos(b_rad)
-    result["y_initial"] = np.sin(l_rad) * np.cos(b_rad)
-    result["z_initial"] = np.sin(b_rad)
+    ra_final_rad = (ra_rad + delta_ra_rad) % (2.0 * np.pi)
+    dec_final_rad = dec_rad + delta_dec_rad
 
-    result["x_final"] = np.cos(l_final_rad) * np.cos(b_final_rad)
-    result["y_final"] = np.sin(l_final_rad) * np.cos(b_final_rad)
-    result["z_final"] = np.sin(b_final_rad)
+    result["x_initial"] = np.cos(dec_rad) * np.cos(ra_rad)
+    result["y_initial"] = np.cos(dec_rad) * np.sin(ra_rad)
+    result["z_initial"] = np.sin(dec_rad)
 
-    result["delta_l_rad"] = delta_l_rad
-    result["delta_b_rad"] = delta_b_rad
-    result["l_final_rad"] = l_final_rad
-    result["b_final_rad"] = b_final_rad
+    result["x_final"] = np.cos(dec_final_rad) * np.cos(ra_final_rad)
+    result["y_final"] = np.cos(dec_final_rad) * np.sin(ra_final_rad)
+    result["z_final"] = np.sin(dec_final_rad)
+
+    result["delta_ra_rad"] = delta_ra_rad
+    result["delta_dec_rad"] = delta_dec_rad
+    result["ra_final_rad"] = ra_final_rad
+    result["dec_final_rad"] = dec_final_rad
 
     return result
 
@@ -197,6 +216,12 @@ def add_cross_product_poles(
     normalize: bool = True,
     copy: bool = True,
 ) -> pd.DataFrame:
+    """
+    Calcula el polo de cada círculo máximo:
+
+        p = x_initial x x_final
+    """
+
     required_columns = [
         x_initial_col,
         y_initial_col,
@@ -205,12 +230,15 @@ def add_cross_product_poles(
         y_final_col,
         z_final_col,
     ]
+
     validate_columns(df, required_columns)
+
     result = df.copy() if copy else df
 
     initial_vectors = result[
         [x_initial_col, y_initial_col, z_initial_col]
     ].to_numpy(dtype=float)
+
     final_vectors = result[
         [x_final_col, y_final_col, z_final_col]
     ].to_numpy(dtype=float)
@@ -226,7 +254,11 @@ def add_cross_product_poles(
     if normalize:
         normalized = np.full_like(pole_vectors, np.nan)
         valid_norm = pole_norm > 0.0
-        normalized[valid_norm] = pole_vectors[valid_norm] / pole_norm[valid_norm, None]
+
+        normalized[valid_norm] = (
+            pole_vectors[valid_norm] / pole_norm[valid_norm, None]
+        )
+
         result["pole_x_unit"] = normalized[:, 0]
         result["pole_y_unit"] = normalized[:, 1]
         result["pole_z_unit"] = normalized[:, 2]
@@ -234,23 +266,9 @@ def add_cross_product_poles(
     return result
 
 
-def unit_vector_to_galactic_lb(vector: np.ndarray) -> Dict[str, float]:
-    vector = np.asarray(vector, dtype=float)
-    norm = np.linalg.norm(vector)
-    if norm == 0.0:
-        raise ValueError("Input vector has zero norm.")
-
-    x, y, z = vector / norm
-    l_rad = np.arctan2(y, x) % (2.0 * np.pi)
-    b_rad = np.arcsin(np.clip(z, -1.0, 1.0))
-
-    return {
-        "l_deg": np.degrees(l_rad),
-        "b_deg": np.degrees(b_rad),
-        "l_rad": l_rad,
-        "b_rad": b_rad,
-    }
-
+# ============================================================
+# Apex estimation
+# ============================================================
 
 def estimate_apex_and_antapex(
     df: pd.DataFrame,
@@ -267,25 +285,36 @@ def estimate_apex_and_antapex(
     orient_with_motion: bool = True,
     min_sources: int = 3,
 ) -> Dict[str, Any]:
-    required_columns = [pole_x_col, pole_y_col, pole_z_col]
-    if weight_col is not None:
-        required_columns.append(weight_col)
-    if orient_with_motion:
-        required_columns.extend(
-            [
-                x_initial_col,
-                y_initial_col,
-                z_initial_col,
-                x_final_col,
-                y_final_col,
-                z_final_col,
-            ]
-        )
-    validate_columns(df, required_columns)
+    """
+    Estima ápex y antápex ajustando el plano de polos.
 
-    poles = df[[pole_x_col, pole_y_col, pole_z_col]].to_numpy(dtype=float)
-    valid_mask = np.isfinite(poles).all(axis=1)
-    pole_norms = np.linalg.norm(poles, axis=1)
+    Si los polos p_i están sobre un gran círculo, entonces el ápex
+    es el vector normal a ese plano. El vector normal se estima como
+    el autovector asociado al menor autovalor de la matriz de covarianza
+    de los polos.
+    """
+
+    required = [
+        pole_x_col,
+        pole_y_col,
+        pole_z_col,
+        x_initial_col,
+        y_initial_col,
+        z_initial_col,
+        x_final_col,
+        y_final_col,
+        z_final_col,
+    ]
+
+    if weight_col is not None:
+        required.append(weight_col)
+
+    validate_columns(df, required)
+
+    poles_all = df[[pole_x_col, pole_y_col, pole_z_col]].to_numpy(dtype=float)
+
+    valid_mask = np.isfinite(poles_all).all(axis=1)
+    pole_norms = np.linalg.norm(poles_all, axis=1)
     valid_mask &= pole_norms > 0.0
 
     if weight_col is not None:
@@ -297,48 +326,76 @@ def estimate_apex_and_antapex(
 
     if valid_mask.sum() < min_sources:
         raise ValueError(
-            "Not enough valid sources to estimate apex. "
+            "Not enough valid poles to estimate apex. "
             f"Found {valid_mask.sum()}, required {min_sources}."
         )
 
-    poles = poles[valid_mask] / pole_norms[valid_mask, None]
+    poles = poles_all[valid_mask] / pole_norms[valid_mask, None]
     weights = weights_all[valid_mask]
-    weights = weights / np.sum(weights)
+    weights_norm = weights / np.sum(weights)
 
-    covariance_matrix = (poles * weights[:, None]).T @ poles
+    covariance_matrix = (poles * weights_norm[:, None]).T @ poles
+
     eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
-    smallest_index = np.argmin(eigenvalues)
 
-    apex_vector = eigenvectors[:, smallest_index]
+    apex_vector = eigenvectors[:, 0]
     apex_vector = apex_vector / np.linalg.norm(apex_vector)
-    toward_apex_fraction = np.nan
+
     oriented = False
+    toward_apex_fraction = np.nan
 
     if orient_with_motion:
-        initial_vectors = df.loc[valid_mask, [x_initial_col, y_initial_col, z_initial_col]].to_numpy(dtype=float)
-        final_vectors = df.loc[valid_mask, [x_final_col, y_final_col, z_final_col]].to_numpy(dtype=float)
+        initial_vectors = df.loc[
+            valid_mask, [x_initial_col, y_initial_col, z_initial_col]
+        ].to_numpy(dtype=float)
+
+        final_vectors = df.loc[
+            valid_mask, [x_final_col, y_final_col, z_final_col]
+        ].to_numpy(dtype=float)
+
         initial_norms = np.linalg.norm(initial_vectors, axis=1)
         final_norms = np.linalg.norm(final_vectors, axis=1)
-        vector_valid = (initial_norms > 0.0) & (final_norms > 0.0)
+
+        vector_valid = (
+            np.isfinite(initial_vectors).all(axis=1)
+            & np.isfinite(final_vectors).all(axis=1)
+            & (initial_norms > 0.0)
+            & (final_norms > 0.0)
+        )
 
         if vector_valid.sum() >= min_sources:
             orientation_weights = weights[vector_valid]
-            initial_vectors = initial_vectors[vector_valid] / initial_norms[vector_valid, None]
-            final_vectors = final_vectors[vector_valid] / final_norms[vector_valid, None]
+
+            initial_vectors = (
+                initial_vectors[vector_valid]
+                / initial_norms[vector_valid, None]
+            )
+
+            final_vectors = (
+                final_vectors[vector_valid]
+                / final_norms[vector_valid, None]
+            )
+
             initial_projection = initial_vectors @ apex_vector
             final_projection = final_vectors @ apex_vector
+
             moving_toward_apex = final_projection > initial_projection
+
             toward_apex_fraction = np.average(
-                moving_toward_apex.astype(float), weights=orientation_weights
+                moving_toward_apex.astype(float),
+                weights=orientation_weights,
             )
+
             if toward_apex_fraction < 0.5:
                 apex_vector = -apex_vector
                 toward_apex_fraction = 1.0 - toward_apex_fraction
+
             oriented = True
 
     antapex_vector = -apex_vector
-    apex_coordinates = unit_vector_to_galactic_lb(apex_vector)
-    antapex_coordinates = unit_vector_to_galactic_lb(antapex_vector)
+
+    apex_coordinates = unit_vector_to_equatorial_radec(apex_vector)
+    antapex_coordinates = unit_vector_to_equatorial_radec(antapex_vector)
 
     pole_plane_residual = np.clip(np.abs(poles @ apex_vector), 0.0, 1.0)
     pole_residual_deg = np.degrees(np.arcsin(pole_plane_residual))
@@ -346,20 +403,29 @@ def estimate_apex_and_antapex(
     return {
         "apex_vector": apex_vector,
         "antapex_vector": antapex_vector,
-        "apex_l_deg": apex_coordinates["l_deg"],
-        "apex_b_deg": apex_coordinates["b_deg"],
-        "apex_l_rad": apex_coordinates["l_rad"],
-        "apex_b_rad": apex_coordinates["b_rad"],
-        "antapex_l_deg": antapex_coordinates["l_deg"],
-        "antapex_b_deg": antapex_coordinates["b_deg"],
-        "antapex_l_rad": antapex_coordinates["l_rad"],
-        "antapex_b_rad": antapex_coordinates["b_rad"],
+
+        "apex_ra_deg": apex_coordinates["ra_deg"],
+        "apex_dec_deg": apex_coordinates["dec_deg"],
+        "apex_ra_rad": apex_coordinates["ra_rad"],
+        "apex_dec_rad": apex_coordinates["dec_rad"],
+
+        "antapex_ra_deg": antapex_coordinates["ra_deg"],
+        "antapex_dec_deg": antapex_coordinates["dec_deg"],
+        "antapex_ra_rad": antapex_coordinates["ra_rad"],
+        "antapex_dec_rad": antapex_coordinates["dec_rad"],
+
         "n_sources": int(valid_mask.sum()),
         "eigenvalues": eigenvalues,
-        "rms_pole_residual_deg": np.sqrt(np.average(pole_residual_deg ** 2, weights=weights)),
-        "median_pole_residual_deg": np.median(pole_residual_deg),
-        "oriented_with_motion": oriented,
-        "toward_apex_fraction": toward_apex_fraction,
+
+        "rms_pole_residual_deg": float(
+            np.sqrt(np.average(pole_residual_deg**2, weights=weights))
+        ),
+        "median_pole_residual_deg": float(np.median(pole_residual_deg)),
+
+        "oriented_with_motion": bool(oriented),
+        "toward_apex_fraction": float(toward_apex_fraction)
+        if np.isfinite(toward_apex_fraction)
+        else np.nan,
     }
 
 
@@ -373,6 +439,8 @@ def apex_from_pole_cross_products(
     pole_norm_min: float = 0.0,
     min_cross_norm: float = 1e-12,
     min_sources: int = 3,
+    max_pairs: int = 200_000,
+    random_state: int = 42,
 ) -> Dict[str, Any]:
     """
     Estima el ápex usando intersecciones entre pares de polos.
@@ -381,8 +449,8 @@ def apex_from_pole_cross_products(
 
         z_ij = p_i x p_j
 
-    La dirección z_ij tiene degeneración ápex/antápex. Por eso se orienta
-    usando `reference_apex_vector`.
+    La dirección z_ij tiene degeneración ápex/antápex. Se orienta usando
+    reference_apex_vector.
     """
 
     required = [pole_x_col, pole_y_col, pole_z_col]
@@ -392,9 +460,7 @@ def apex_from_pole_cross_products(
 
     validate_columns(df, required)
 
-    poles_all = df[[pole_x_col, pole_y_col, pole_z_col]].to_numpy(
-        dtype=float
-    )
+    poles_all = df[[pole_x_col, pole_y_col, pole_z_col]].to_numpy(dtype=float)
 
     valid = np.isfinite(poles_all).all(axis=1)
     pole_norms = np.linalg.norm(poles_all, axis=1)
@@ -430,203 +496,153 @@ def apex_from_pole_cross_products(
 
     reference_apex_vector = reference_apex_vector / reference_norm
 
-    intersections = []
-    intersection_weights = []
-
     n_poles = len(poles)
 
-    for i in range(n_poles):
-        for j in range(i + 1, n_poles):
-            cross = np.cross(poles[i], poles[j])
-            cross_norm = np.linalg.norm(cross)
+    pair_i, pair_j = np.triu_indices(n_poles, k=1)
 
-            if cross_norm <= min_cross_norm:
-                continue
+    n_pairs_total = len(pair_i)
 
-            unit_cross = cross / cross_norm
+    if n_pairs_total == 0:
+        raise ValueError("No pole pairs available.")
 
-            if np.dot(unit_cross, reference_apex_vector) < 0.0:
-                unit_cross = -unit_cross
+    if n_pairs_total > max_pairs:
+        rng = np.random.default_rng(random_state)
+        selected = rng.choice(n_pairs_total, size=max_pairs, replace=False)
+        pair_i = pair_i[selected]
+        pair_j = pair_j[selected]
 
-            pair_weight = weights[i] * weights[j] * cross_norm
+    cross_vectors = np.cross(poles[pair_i], poles[pair_j])
+    cross_norms = np.linalg.norm(cross_vectors, axis=1)
 
-            intersections.append(unit_cross)
-            intersection_weights.append(pair_weight)
+    valid_cross = np.isfinite(cross_vectors).all(axis=1)
+    valid_cross &= cross_norms > min_cross_norm
 
-    if len(intersections) == 0:
-        raise ValueError("No valid cross-product intersections found.")
+    if valid_cross.sum() < min_sources:
+        raise ValueError(
+            "Not enough valid pole intersections. "
+            f"Found {valid_cross.sum()}, required {min_sources}."
+        )
 
-    intersections = np.vstack(intersections)
-    intersection_weights = np.asarray(intersection_weights, dtype=float)
+    cross_vectors = cross_vectors[valid_cross] / cross_norms[valid_cross, None]
 
-    weight_sum = np.sum(intersection_weights)
+    pair_weights = weights[pair_i[valid_cross]] * weights[pair_j[valid_cross]]
 
-    if weight_sum <= 0.0:
-        raise ValueError("Cross-product weights are all zero.")
+    orientation = np.sign(cross_vectors @ reference_apex_vector)
+    orientation[orientation == 0.0] = 1.0
 
-    intersection_weights = intersection_weights / weight_sum
+    cross_vectors = cross_vectors * orientation[:, None]
 
-    mean_vector = np.sum(
-        intersections * intersection_weights[:, None],
-        axis=0,
-    )
+    weighted_mean = np.average(cross_vectors, axis=0, weights=pair_weights)
+    mean_norm = np.linalg.norm(weighted_mean)
 
-    mean_norm = np.linalg.norm(mean_vector)
+    if mean_norm == 0.0 or not np.isfinite(mean_norm):
+        raise ValueError("Cross-product apex has zero or invalid norm.")
 
-    if mean_norm == 0.0:
-        raise ValueError("Mean cross-product vector has zero norm.")
-
-    apex_vector = mean_vector / mean_norm
+    apex_vector = weighted_mean / mean_norm
     antapex_vector = -apex_vector
 
-    apex_coordinates = unit_vector_to_galactic_lb(apex_vector)
-    antapex_coordinates = unit_vector_to_galactic_lb(antapex_vector)
+    apex_coordinates = unit_vector_to_equatorial_radec(apex_vector)
+    antapex_coordinates = unit_vector_to_equatorial_radec(antapex_vector)
 
-    angular_residuals = np.degrees(
-        np.arccos(np.clip(intersections @ apex_vector, -1.0, 1.0))
-    )
+    cos_angles = np.clip(cross_vectors @ apex_vector, -1.0, 1.0)
+    angular_residuals_deg = np.degrees(np.arccos(cos_angles))
 
     return {
         "apex_vector": apex_vector,
         "antapex_vector": antapex_vector,
-        "apex_l_deg": apex_coordinates["l_deg"],
-        "apex_b_deg": apex_coordinates["b_deg"],
-        "antapex_l_deg": antapex_coordinates["l_deg"],
-        "antapex_b_deg": antapex_coordinates["b_deg"],
-        "n_intersections": int(len(intersections)),
+
+        "apex_ra_deg": apex_coordinates["ra_deg"],
+        "apex_dec_deg": apex_coordinates["dec_deg"],
+        "apex_ra_rad": apex_coordinates["ra_rad"],
+        "apex_dec_rad": apex_coordinates["dec_rad"],
+
+        "antapex_ra_deg": antapex_coordinates["ra_deg"],
+        "antapex_dec_deg": antapex_coordinates["dec_deg"],
+        "antapex_ra_rad": antapex_coordinates["ra_rad"],
+        "antapex_dec_rad": antapex_coordinates["dec_rad"],
+
+        "n_sources": int(n_poles),
+        "n_pairs_total": int(n_pairs_total),
+        "n_pairs_used": int(valid_cross.sum()),
+
         "rms_intersection_residual_deg": float(
-            np.sqrt(np.mean(angular_residuals**2))
+            np.sqrt(np.average(angular_residuals_deg**2, weights=pair_weights))
         ),
         "median_intersection_residual_deg": float(
-            np.median(angular_residuals)
+            np.median(angular_residuals_deg)
         ),
     }
 
 
-def galactic_lb_to_unit_vector(l_deg: float, b_deg: float) -> np.ndarray:
-    l_rad = np.deg2rad(l_deg)
-    b_rad = np.deg2rad(b_deg)
-    return np.array(
-        [
-            np.cos(l_rad) * np.cos(b_rad),
-            np.sin(l_rad) * np.cos(b_rad),
-            np.sin(b_rad),
-        ],
-        dtype=float,
-    )
-
+# ============================================================
+# Lambda angle relative to apex
+# ============================================================
 
 def add_lambda_angle_from_apex(
     df: pd.DataFrame,
     apex_vector: Optional[np.ndarray] = None,
-    apex_l_deg: Optional[float] = None,
-    apex_b_deg: Optional[float] = None,
-    l_col: str = "l",
-    b_col: str = "b",
+    apex_ra_deg: Optional[float] = None,
+    apex_dec_deg: Optional[float] = None,
+    ra_col: str = "ra",
+    dec_col: str = "dec",
     copy: bool = True,
 ) -> pd.DataFrame:
     """
-    Agrega el ángulo lambda entre cada estrella y el ápex.
+    Agrega el ángulo lambda entre cada estrella y el ápex en coordenadas ICRS.
 
-    Esta versión usa directamente trigonometría esférica:
-
-        cos(lambda) =
-            sin(b) sin(b_apex)
-            + cos(b) cos(b_apex) cos(l_apex - l)
-
-    y calcula lambda con:
-
-        lambda = atan2(sin(lambda), cos(lambda))
-
-    en vez de usar arccos directamente. Esto es más estable
-    numéricamente cerca del ápex y del antápex.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame de entrada. Debe contener coordenadas galácticas.
-
-    apex_vector : np.ndarray or None
-        Vector unitario del ápex en coordenadas galácticas cartesianas.
-        Si no se proporciona, deben pasarse `apex_l_deg` y `apex_b_deg`.
-
-    apex_l_deg : float or None
-        Longitud galáctica del ápex, en grados.
-
-    apex_b_deg : float or None
-        Latitud galáctica del ápex, en grados.
-
-    l_col : str, optional
-        Columna con longitud galáctica, en grados.
-
-    b_col : str, optional
-        Columna con latitud galáctica, en grados.
-
-    copy : bool, optional
-        Si True, devuelve una copia modificada.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame con columnas nuevas:
-
-        - lambda_rad
-        - lambda_deg
-        - sin_lambda
-        - cos_lambda
-        - delta_l_apex_rad
-        - delta_l_apex_deg
-        - lambda_tangent_l
-        - lambda_tangent_b
+    cos(lambda) =
+        sin(dec) sin(dec_apex)
+        + cos(dec) cos(dec_apex) cos(ra_apex - ra)
     """
 
-    validate_columns(df, [l_col, b_col])
+    validate_columns(df, [ra_col, dec_col])
 
     result = df.copy() if copy else df
 
     if apex_vector is not None:
-        apex_coordinates = unit_vector_to_galactic_lb(apex_vector)
-        apex_l_deg = apex_coordinates["l_deg"]
-        apex_b_deg = apex_coordinates["b_deg"]
+        apex_coordinates = unit_vector_to_equatorial_radec(apex_vector)
+        apex_ra_deg = apex_coordinates["ra_deg"]
+        apex_dec_deg = apex_coordinates["dec_deg"]
 
-    if apex_l_deg is None or apex_b_deg is None:
+    if apex_ra_deg is None or apex_dec_deg is None:
         raise ValueError(
             "You must provide either apex_vector or both "
-            "apex_l_deg and apex_b_deg."
+            "apex_ra_deg and apex_dec_deg."
         )
 
-    l_rad = np.deg2rad(result[l_col].to_numpy(dtype=float))
-    b_rad = np.deg2rad(result[b_col].to_numpy(dtype=float))
+    ra_rad = np.deg2rad(result[ra_col].to_numpy(dtype=float))
+    dec_rad = np.deg2rad(result[dec_col].to_numpy(dtype=float))
 
-    apex_l_rad = np.deg2rad(float(apex_l_deg))
-    apex_b_rad = np.deg2rad(float(apex_b_deg))
+    apex_ra_rad = np.deg2rad(float(apex_ra_deg))
+    apex_dec_rad = np.deg2rad(float(apex_dec_deg))
 
-    delta_l_rad = apex_l_rad - l_rad
-    delta_l_rad = (delta_l_rad + np.pi) % (2.0 * np.pi) - np.pi
+    delta_ra_rad = apex_ra_rad - ra_rad
+    delta_ra_rad = (delta_ra_rad + np.pi) % (2.0 * np.pi) - np.pi
 
-    sin_b = np.sin(b_rad)
-    cos_b = np.cos(b_rad)
+    sin_dec = np.sin(dec_rad)
+    cos_dec = np.cos(dec_rad)
 
-    sin_b_apex = np.sin(apex_b_rad)
-    cos_b_apex = np.cos(apex_b_rad)
+    sin_dec_apex = np.sin(apex_dec_rad)
+    cos_dec_apex = np.cos(apex_dec_rad)
 
-    cos_delta_l = np.cos(delta_l_rad)
-    sin_delta_l = np.sin(delta_l_rad)
+    cos_delta_ra = np.cos(delta_ra_rad)
+    sin_delta_ra = np.sin(delta_ra_rad)
 
     cos_lambda = (
-        sin_b * sin_b_apex
-        + cos_b * cos_b_apex * cos_delta_l
+        sin_dec * sin_dec_apex
+        + cos_dec * cos_dec_apex * cos_delta_ra
     )
     cos_lambda = np.clip(cos_lambda, -1.0, 1.0)
 
-    tangent_l_numerator = cos_b_apex * sin_delta_l
-    tangent_b_numerator = (
-        cos_b * sin_b_apex
-        - sin_b * cos_b_apex * cos_delta_l
+    tangent_ra_numerator = cos_dec_apex * sin_delta_ra
+
+    tangent_dec_numerator = (
+        cos_dec * sin_dec_apex
+        - sin_dec * cos_dec_apex * cos_delta_ra
     )
 
     sin_lambda = np.sqrt(
-        tangent_l_numerator**2 + tangent_b_numerator**2
+        tangent_ra_numerator**2 + tangent_dec_numerator**2
     )
     sin_lambda = np.clip(sin_lambda, 0.0, 1.0)
 
@@ -637,31 +653,39 @@ def add_lambda_angle_from_apex(
     result["sin_lambda"] = sin_lambda
     result["cos_lambda"] = cos_lambda
 
-    result["delta_l_apex_rad"] = delta_l_rad
-    result["delta_l_apex_deg"] = np.rad2deg(delta_l_rad)
+    result["delta_ra_apex_rad"] = delta_ra_rad
+    result["delta_ra_apex_deg"] = np.rad2deg(delta_ra_rad)
 
     valid_sin_lambda = sin_lambda > 1e-15
 
-    result["lambda_tangent_l"] = np.where(
+    result["lambda_tangent_ra"] = np.where(
         valid_sin_lambda,
-        tangent_l_numerator / sin_lambda,
+        tangent_ra_numerator / sin_lambda,
         np.nan,
     )
 
-    result["lambda_tangent_b"] = np.where(
+    result["lambda_tangent_dec"] = np.where(
         valid_sin_lambda,
-        tangent_b_numerator / sin_lambda,
+        tangent_dec_numerator / sin_lambda,
         np.nan,
     )
 
     return result
 
 
+# ============================================================
+# Data preparation
+# ============================================================
+
 def prepare_dataframe(
     df: pd.DataFrame,
     group_col: str = "grupo",
-    ra_col: str = "coordenada_ra",
-    dec_col: str = "coordenada_dec",
+    division_ra_col: str = "coordenada_ra",
+    division_dec_col: str = "coordenada_dec",
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
     parallax_col: str = "parallax",
     count_col: str = "ConteoAgrupaciones",
     present_col: str = "PresenteEnMuestras",
@@ -669,45 +693,80 @@ def prepare_dataframe(
     weight_col: str = "probabilidad",
     weight_fill_value: Optional[float] = None,
 ) -> pd.DataFrame:
+    """
+    Prepara el DataFrame para el análisis del ápex en RA/Dec.
+
+    Crea:
+        - cluster_id, si no existe.
+        - distance_pc, si no existe.
+        - probabilidad, si no existe.
+        - vectores inicial/final ICRS.
+        - polos por producto cruz.
+    """
+
     result = df.copy()
 
     if cluster_col not in result.columns:
         result = create_cluster_id(
             result,
             group_col=group_col,
-            ra_col=ra_col,
-            dec_col=dec_col,
+            ra_col=division_ra_col,
+            dec_col=division_dec_col,
             cluster_col=cluster_col,
         )
 
     if "distance_pc" not in result.columns:
         validate_columns(result, [parallax_col])
-        result["distance_pc"] = 1000.0 / result[parallax_col].astype(float)
+
+        parallax = result[parallax_col].astype(float)
+
+        result["distance_pc"] = np.where(
+            parallax > 0.0,
+            1000.0 / parallax,
+            np.nan,
+        )
 
     if weight_col not in result.columns:
-        # If a fallback weight value was provided, use it for all rows.
         if weight_fill_value is not None:
             result[weight_col] = float(weight_fill_value)
         else:
-            # Otherwise try to compute the probability from counts/presence.
             validate_columns(result, [count_col, present_col])
-            result[weight_col] = (
-                result[count_col].astype(float) / result[present_col].astype(float)
+
+            present = result[present_col].astype(float)
+            count = result[count_col].astype(float)
+
+            result[weight_col] = np.where(
+                present > 0.0,
+                count / present,
+                np.nan,
             )
 
-    result = add_galactic_coordinates(result)
-    result = add_galactic_proper_motions(result)
-    result = add_initial_final_galactic_vectors(result)
+    result = add_initial_final_equatorial_vectors(
+        result,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        pmra_col=pmra_col,
+        pmdec_col=pmdec_col,
+    )
+
     result = add_cross_product_poles(result)
 
     return result
 
+
+# ============================================================
+# Cluster processing
+# ============================================================
 
 def process_single_cluster(
     df: pd.DataFrame,
     cluster_id: Union[str, int],
     cluster_col: str = "cluster_id",
     weight_col: Optional[str] = "probabilidad",
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
     min_stars: int = 3,
     refine_apex: bool = True,
     min_sin_lambda: float = 0.15,
@@ -716,15 +775,15 @@ def process_single_cluster(
     """
     Procesa un único cúmulo y estima su ápex inicial y refinado.
 
-    El refinado elimina estrellas cercanas al ápex o antápex usando:
+    El refinamiento elimina estrellas cercanas al ápex o antápex usando:
 
-        sin_lambda >= min_sin_lambda
+        sin(lambda) >= min_sin_lambda
 
     Esto evita fuentes con movimiento tangencial muy pequeño, donde el polo
     del círculo máximo queda peor condicionado.
     """
 
-    validate_columns(df, [cluster_col])
+    validate_columns(df, [cluster_col, ra_col, dec_col, pmra_col, pmdec_col])
 
     df_cluster = df[df[cluster_col] == cluster_id].copy()
 
@@ -746,6 +805,7 @@ def process_single_cluster(
 
         valid_weights = (
             df_cluster[effective_weight_col].notna()
+            & np.isfinite(df_cluster[effective_weight_col])
             & (df_cluster[effective_weight_col] > 0)
         )
 
@@ -760,6 +820,7 @@ def process_single_cluster(
         apex_initial = estimate_apex_and_antapex(
             df_cluster,
             weight_col=effective_weight_col,
+            min_sources=min_stars,
         )
     except ValueError as exc:
         print(f"Cluster {cluster_id}: error computing initial apex - {exc}")
@@ -768,6 +829,8 @@ def process_single_cluster(
     df_initial = add_lambda_angle_from_apex(
         df_cluster,
         apex_vector=apex_initial["apex_vector"],
+        ra_col=ra_col,
+        dec_col=dec_col,
     )
 
     df_initial["lambda_deg_initial"] = df_initial["lambda_deg"]
@@ -775,12 +838,13 @@ def process_single_cluster(
     df_initial["cos_lambda_initial"] = df_initial["cos_lambda"]
 
     df_initial["pm_total"] = np.sqrt(
-        df_initial["pm_l_cosb"] ** 2 + df_initial["pm_b"] ** 2
+        df_initial[pmra_col].astype(float) ** 2
+        + df_initial[pmdec_col].astype(float) ** 2
     )
 
     if "distance_pc" in df_initial.columns:
         df_initial["vt_kms"] = (
-            4.74
+            KM_S_PER_AU_YR
             * (df_initial["pm_total"] / 1000.0)
             * df_initial["distance_pc"]
         )
@@ -793,215 +857,411 @@ def process_single_cluster(
             pole_norm_min=min_pole_norm,
             min_sources=min_stars,
         )
-    except Exception as exc:
-        cross_initial = {"error": str(exc)}
+    except ValueError as exc:
+        print(
+            f"Cluster {cluster_id}: cross-product initial apex failed - {exc}"
+        )
+        cross_initial = None
 
-    apex_refined = None
-    cross_refined = None
     df_refined = df_initial.copy()
-
-    refinement_summary = {
-        "enabled": bool(refine_apex),
-        "min_sin_lambda": float(min_sin_lambda),
-        "min_pole_norm": float(min_pole_norm),
-        "n_initial": int(len(df_initial)),
-        "n_refined": int(len(df_initial)),
-        "fraction_kept": 1.0,
-        "status": "not_applied",
-    }
+    apex_refined = apex_initial
+    cross_refined = cross_initial
 
     if refine_apex:
-        refined_mask = (
-            np.isfinite(df_initial["sin_lambda_initial"])
-            & (df_initial["sin_lambda_initial"] >= min_sin_lambda)
+        refinement_mask = (
+            df_initial["sin_lambda"].notna()
+            & np.isfinite(df_initial["sin_lambda"])
+            & (df_initial["sin_lambda"] >= min_sin_lambda)
+            & (df_initial["pole_norm"] > min_pole_norm)
         )
 
-        if "pole_norm" in df_initial.columns:
-            refined_mask &= (
-                np.isfinite(df_initial["pole_norm"])
-                & (df_initial["pole_norm"] >= min_pole_norm)
-            )
+        df_refined_candidate = df_initial[refinement_mask].copy()
 
-        df_refined = df_initial.loc[refined_mask].copy()
-
-        refinement_summary["n_refined"] = int(len(df_refined))
-        refinement_summary["fraction_kept"] = float(
-            len(df_refined) / len(df_initial)
-        )
-
-        if len(df_refined) < min_stars:
-            refinement_summary["status"] = "not_enough_sources_after_filter"
-
-            apex_refined = {
-                "error": (
-                    "Not enough sources after refinement filter. "
-                    f"Found {len(df_refined)}, required {min_stars}."
-                )
-            }
-            cross_refined = {
-                "error": "Refined apex was not computed."
-            }
-
-        else:
+        if len(df_refined_candidate) >= min_stars:
             try:
                 apex_refined = estimate_apex_and_antapex(
-                    df_refined,
+                    df_refined_candidate,
                     weight_col=effective_weight_col,
+                    min_sources=min_stars,
                 )
 
                 df_refined = add_lambda_angle_from_apex(
-                    df_refined,
+                    df_refined_candidate,
                     apex_vector=apex_refined["apex_vector"],
+                    ra_col=ra_col,
+                    dec_col=dec_col,
                 )
 
                 df_refined["lambda_deg_refined"] = df_refined["lambda_deg"]
                 df_refined["sin_lambda_refined"] = df_refined["sin_lambda"]
                 df_refined["cos_lambda_refined"] = df_refined["cos_lambda"]
 
-                cross_refined = apex_from_pole_cross_products(
-                    df_refined,
-                    reference_apex_vector=apex_refined["apex_vector"],
-                    weight_col=effective_weight_col,
-                    pole_norm_min=min_pole_norm,
-                    min_sources=min_stars,
+                df_refined["pm_total"] = np.sqrt(
+                    df_refined[pmra_col].astype(float) ** 2
+                    + df_refined[pmdec_col].astype(float) ** 2
                 )
 
-                refinement_summary["status"] = "ok"
+                if "distance_pc" in df_refined.columns:
+                    df_refined["vt_kms"] = (
+                        KM_S_PER_AU_YR
+                        * (df_refined["pm_total"] / 1000.0)
+                        * df_refined["distance_pc"]
+                    )
 
-            except Exception as exc:
-                refinement_summary["status"] = "failed"
-                apex_refined = {"error": str(exc)}
-                cross_refined = {"error": str(exc)}
+                try:
+                    cross_refined = apex_from_pole_cross_products(
+                        df_refined,
+                        reference_apex_vector=apex_refined["apex_vector"],
+                        weight_col=effective_weight_col,
+                        pole_norm_min=min_pole_norm,
+                        min_sources=min_stars,
+                    )
+                except ValueError as exc:
+                    print(
+                        f"Cluster {cluster_id}: cross-product refined apex "
+                        f"failed - {exc}"
+                    )
+                    cross_refined = None
 
-    preferred_apex = (
-        apex_refined
-        if isinstance(apex_refined, dict) and "error" not in apex_refined
-        else apex_initial
-    )
+            except ValueError as exc:
+                print(
+                    f"Cluster {cluster_id}: refined apex failed - {exc}. "
+                    "Using initial apex."
+                )
 
-    preferred_cross_apex = (
-        cross_refined
-        if isinstance(cross_refined, dict) and "error" not in cross_refined
-        else cross_initial
-    )
+        else:
+            print(
+                f"Cluster {cluster_id}: only {len(df_refined_candidate)} "
+                "stars after refinement cut. Using initial apex."
+            )
 
     return {
         "cluster_id": cluster_id,
-        "n_stars": int(len(df_initial)),
+        "n_stars": int(len(df_cluster)),
+        "n_stars_initial": int(len(df_initial)),
         "n_stars_refined": int(len(df_refined)),
         "weight_col_used": effective_weight_col,
-        "refinement": refinement_summary,
 
-        # Salida recomendada para usar directamente.
-        "apex_result": preferred_apex,
-        "apex_from_pole_crosses": preferred_cross_apex,
-
-        # Salidas explícitas.
         "apex_initial": apex_initial,
         "apex_refined": apex_refined,
-        "apex_from_pole_crosses_initial": cross_initial,
-        "apex_from_pole_crosses_refined": cross_refined,
 
-        # DataFrames.
-        "df": df_refined,
-        "df_initial": df_initial,
-        "df_refined": df_refined,
+        "cross_initial": cross_initial,
+        "cross_refined": cross_refined,
+
+        "data_initial": df_initial,
+        "data_refined": df_refined,
     }
 
 
+def process_all_clusters(
+    df: pd.DataFrame,
+    cluster_col: str = "cluster_id",
+    weight_col: Optional[str] = "probabilidad",
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
+    min_stars: int = 3,
+    refine_apex: bool = True,
+    min_sin_lambda: float = 0.15,
+    min_pole_norm: float = 0.0,
+) -> List[Dict[str, Any]]:
+    """
+    Procesa todos los cluster_id presentes en el DataFrame.
+    """
+
+    validate_columns(df, [cluster_col])
+
+    results: List[Dict[str, Any]] = []
+
+    cluster_ids = pd.Index(df[cluster_col].dropna().unique())
+
+    for cid in cluster_ids:
+        cluster_result = process_single_cluster(
+            df=df,
+            cluster_id=cid,
+            cluster_col=cluster_col,
+            weight_col=weight_col,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            pmra_col=pmra_col,
+            pmdec_col=pmdec_col,
+            min_stars=min_stars,
+            refine_apex=refine_apex,
+            min_sin_lambda=min_sin_lambda,
+            min_pole_norm=min_pole_norm,
+        )
+
+        if cluster_result is not None:
+            results.append(cluster_result)
+
+    return results
+
+
+# ============================================================
+# Result summarization
+# ============================================================
+
+def _safe_get(result: Optional[Dict[str, Any]], key: str) -> Any:
+    if result is None:
+        return np.nan
+
+    return result.get(key, np.nan)
+
+
+def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convierte el resultado completo de un cúmulo en una fila plana.
+    Útil para guardar en CSV.
+    """
+
+    apex_initial = result["apex_initial"]
+    apex_refined = result["apex_refined"]
+
+    cross_initial = result.get("cross_initial")
+    cross_refined = result.get("cross_refined")
+
+    return {
+        "cluster_id": result["cluster_id"],
+        "n_stars": result["n_stars"],
+        "n_stars_initial": result["n_stars_initial"],
+        "n_stars_refined": result["n_stars_refined"],
+
+        "apex_initial_ra_deg": apex_initial["apex_ra_deg"],
+        "apex_initial_dec_deg": apex_initial["apex_dec_deg"],
+        "antapex_initial_ra_deg": apex_initial["antapex_ra_deg"],
+        "antapex_initial_dec_deg": apex_initial["antapex_dec_deg"],
+        "rms_pole_residual_initial_deg": apex_initial[
+            "rms_pole_residual_deg"
+        ],
+        "median_pole_residual_initial_deg": apex_initial[
+            "median_pole_residual_deg"
+        ],
+        "toward_apex_fraction_initial": apex_initial[
+            "toward_apex_fraction"
+        ],
+
+        "apex_refined_ra_deg": apex_refined["apex_ra_deg"],
+        "apex_refined_dec_deg": apex_refined["apex_dec_deg"],
+        "antapex_refined_ra_deg": apex_refined["antapex_ra_deg"],
+        "antapex_refined_dec_deg": apex_refined["antapex_dec_deg"],
+        "rms_pole_residual_refined_deg": apex_refined[
+            "rms_pole_residual_deg"
+        ],
+        "median_pole_residual_refined_deg": apex_refined[
+            "median_pole_residual_deg"
+        ],
+        "toward_apex_fraction_refined": apex_refined[
+            "toward_apex_fraction"
+        ],
+
+        "cross_initial_apex_ra_deg": _safe_get(cross_initial, "apex_ra_deg"),
+        "cross_initial_apex_dec_deg": _safe_get(cross_initial, "apex_dec_deg"),
+        "cross_initial_rms_residual_deg": _safe_get(
+            cross_initial,
+            "rms_intersection_residual_deg",
+        ),
+        "cross_initial_n_pairs_used": _safe_get(cross_initial, "n_pairs_used"),
+
+        "cross_refined_apex_ra_deg": _safe_get(cross_refined, "apex_ra_deg"),
+        "cross_refined_apex_dec_deg": _safe_get(cross_refined, "apex_dec_deg"),
+        "cross_refined_rms_residual_deg": _safe_get(
+            cross_refined,
+            "rms_intersection_residual_deg",
+        ),
+        "cross_refined_n_pairs_used": _safe_get(cross_refined, "n_pairs_used"),
+    }
+
+
+def summarize_all_cluster_results(
+    results: List[Dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Convierte una lista de resultados en una tabla resumen.
+    """
+
+    rows = [summarize_cluster_result(result) for result in results]
+    return pd.DataFrame(rows)
+
 def run_cluster_analysis_from_dataframe(
     df: pd.DataFrame,
-    cluster_id: Union[str, int],
+    cluster_id: Optional[Union[str, int]] = None,
+    group_col: str = "grupo",
+    division_ra_col: str = "coordenada_ra",
+    division_dec_col: str = "coordenada_dec",
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
+    parallax_col: str = "parallax",
+    count_col: str = "ConteoAgrupaciones",
+    present_col: str = "PresenteEnMuestras",
+    cluster_col: str = "cluster_id",
     weight_col: Optional[str] = "probabilidad",
-    weight_fill_value: Optional[float] = 1.0,
-    **prepare_kwargs: Any,
+    weight_fill_value: Optional[float] = None,
+    min_stars: int = 3,
+    refine_apex: bool = True,
+    min_sin_lambda: float = 0.15,
+    min_pole_norm: float = 0.0,
 ) -> Dict[str, Any]:
-    """Run apex analysis using an already-loaded DataFrame.
-
-    By default `weight_fill_value=1.0` so the function will not fail
-    when probability/count columns are missing.
     """
-    # Ensure the prepare step receives the fallback weight value.
-    prepare_kwargs.setdefault("weight_fill_value", weight_fill_value)
-    return run_cluster_analysis(
+    Ejecuta el análisis completo desde un DataFrame de pandas ya cargado.
+
+    Si cluster_id es None, procesa todos los cúmulos.
+    Si cluster_id se proporciona, procesa solo ese cúmulo.
+
+    El DataFrame debe contener, como mínimo:
+        ra, dec, pmra, pmdec, parallax
+
+    Y además, si no existe cluster_id:
+        grupo, coordenada_ra, coordenada_dec
+
+    Si weight_col='probabilidad' no existe, se calcula como:
+        ConteoAgrupaciones / PresenteEnMuestras
+
+    Si no quieres usar pesos, pasa:
+        weight_col=None
+    """
+
+    prepared = prepare_dataframe(
         df,
-        cluster_id=cluster_id,
-        weight_col=weight_col,
-        **prepare_kwargs,
+        group_col=group_col,
+        division_ra_col=division_ra_col,
+        division_dec_col=division_dec_col,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        pmra_col=pmra_col,
+        pmdec_col=pmdec_col,
+        parallax_col=parallax_col,
+        count_col=count_col,
+        present_col=present_col,
+        cluster_col=cluster_col,
+        weight_col=weight_col if weight_col is not None else "probabilidad",
+        weight_fill_value=weight_fill_value,
     )
 
+    effective_weight_col = weight_col
+
+    if weight_col is None:
+        effective_weight_col = None
+
+    if cluster_id is not None:
+        cluster_result = process_single_cluster(
+            df=prepared,
+            cluster_id=cluster_id,
+            cluster_col=cluster_col,
+            weight_col=effective_weight_col,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            pmra_col=pmra_col,
+            pmdec_col=pmdec_col,
+            min_stars=min_stars,
+            refine_apex=refine_apex,
+            min_sin_lambda=min_sin_lambda,
+            min_pole_norm=min_pole_norm,
+        )
+
+        summary = (
+            summarize_cluster_result(cluster_result)
+            if cluster_result is not None
+            else None
+        )
+
+        return {
+            "data": prepared,
+            "cluster_result": cluster_result,
+            "summary": summary,
+        }
+
+    cluster_results = process_all_clusters(
+        df=prepared,
+        cluster_col=cluster_col,
+        weight_col=effective_weight_col,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        pmra_col=pmra_col,
+        pmdec_col=pmdec_col,
+        min_stars=min_stars,
+        refine_apex=refine_apex,
+        min_sin_lambda=min_sin_lambda,
+        min_pole_norm=min_pole_norm,
+    )
+
+    summary_df = summarize_all_cluster_results(cluster_results)
+
+    return {
+        "data": prepared,
+        "cluster_results": cluster_results,
+        "summary": summary_df,
+    }
+
+
+# ============================================================
+# High-level runner
+# ============================================================
 
 def run_cluster_analysis(
-    source: Union[str, Path, pd.DataFrame],
-    cluster_id: Union[str, int],
+    data_path: Union[str, Path],
+    cluster_id: Optional[Union[str, int]] = None,
+    group_col: str = "grupo",
+    division_ra_col: str = "coordenada_ra",
+    division_dec_col: str = "coordenada_dec",
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
+    parallax_col: str = "parallax",
+    count_col: str = "ConteoAgrupaciones",
+    present_col: str = "PresenteEnMuestras",
+    cluster_col: str = "cluster_id",
     weight_col: Optional[str] = "probabilidad",
-    weight_fill_value: Optional[float] = 1.0,
-    **prepare_kwargs: Any,
+    weight_fill_value: Optional[float] = None,
+    min_stars: int = 3,
+    refine_apex: bool = True,
+    min_sin_lambda: float = 0.15,
+    min_pole_norm: float = 0.0,
 ) -> Dict[str, Any]:
-    """Run apex analysis from a CSV path or a pandas DataFrame.
-
-    Parameters
-    ----------
-    source : Union[str, Path, pd.DataFrame]
-        Path to a CSV file or a loaded pandas DataFrame.
-    cluster_id : Union[str, int]
-        Cluster identifier.
-    weight_col : Optional[str]
-        Column used for weights.
     """
-    if isinstance(source, (str, Path)):
-        path = Path(source)
-        df = pd.read_csv(path)
-    elif isinstance(source, pd.DataFrame):
-        df = source.copy()
-    else:
-        raise TypeError("source must be a file path or a pandas DataFrame")
+    Ejecuta el análisis completo desde un archivo CSV.
+    """
 
-    # Pass default fallback weight into prepare step unless overridden.
-    prepare_kwargs.setdefault("weight_fill_value", weight_fill_value)
+    data_path = Path(data_path)
+    df = pd.read_csv(data_path)
 
-    df_prepared = prepare_dataframe(df, **prepare_kwargs)
-    result = process_single_cluster(
-        df_prepared,
+    return run_cluster_analysis_from_dataframe(
+        df=df,
         cluster_id=cluster_id,
+        group_col=group_col,
+        division_ra_col=division_ra_col,
+        division_dec_col=division_dec_col,
+        ra_col=ra_col,
+        dec_col=dec_col,
+        pmra_col=pmra_col,
+        pmdec_col=pmdec_col,
+        parallax_col=parallax_col,
+        count_col=count_col,
+        present_col=present_col,
+        cluster_col=cluster_col,
         weight_col=weight_col,
+        weight_fill_value=weight_fill_value,
+        min_stars=min_stars,
+        refine_apex=refine_apex,
+        min_sin_lambda=min_sin_lambda,
+        min_pole_norm=min_pole_norm,
     )
 
-    if result is None:
-        raise ValueError(f"Cluster {cluster_id} could not be processed.")
-    return result
 
+# ============================================================
+# Optional CLI-style execution
+# ============================================================
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Run single-cluster apex analysis."
-    )
-    parser.add_argument(
-        "data_path",
-        help="Path to the input CSV file",
-    )
-    parser.add_argument(
-        "cluster_id",
-        help="Cluster identifier to process",
-    )
-    parser.add_argument(
-        "--weight-col",
-        default="probabilidad",
-        help="Column to use for weights (default: probabilidad)",
-    )
-    args = parser.parse_args()
-
-    analysis_result = run_cluster_analysis(
-        args.data_path,
-        cluster_id=args.cluster_id,
-        weight_col=args.weight_col,
-    )
-
-    apex = analysis_result["apex_result"]
-    print(f"Cluster: {analysis_result['cluster_id']}")
-    print(f"Stars: {analysis_result['n_stars']}")
-    print(f"Apex l,b = {apex['apex_l_deg']:.3f}, {apex['apex_b_deg']:.3f}")
-    print(f"Antapex l,b = {apex['antapex_l_deg']:.3f}, {apex['antapex_b_deg']:.3f}")
-    print(f"RMS residual = {apex['rms_pole_residual_deg']:.4f} deg")
+    # Ejemplo mínimo. Edita estas rutas/IDs según tu caso.
+    #
+    # result = run_cluster_analysis(
+    #     data_path="data/datos_clusterizados.csv",
+    #     cluster_id="8_123",
+    # )
+    #
+    # print(result["summary"])
+    pass
