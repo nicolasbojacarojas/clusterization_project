@@ -3223,11 +3223,6 @@ def correct_gaia_proper_motions(
     # 10. Transformar los movimientos propios corregidos de vuelta a ICRS
     # ------------------------------------------------------------------
     #
-    # Tu código de apex probablemente trabaja con:
-    #     ra, dec, pmra, pmdec
-    #
-    # Por eso, después de corregir en coordenadas galácticas, volvemos a ICRS.
-    #
     # El resultado final será:
     #     pmra_corr
     #     pmdec_corr
