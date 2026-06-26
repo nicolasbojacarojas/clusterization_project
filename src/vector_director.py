@@ -27,6 +27,8 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy as np
 import pandas as pd
+from astropy import units as u
+from astropy.coordinates import SkyCoord, CartesianRepresentation
 
 
 MAS_TO_RAD = np.deg2rad(1.0 / 3_600_000.0)
@@ -111,6 +113,42 @@ def equatorial_radec_to_unit_vector(
         dtype=float,
     )
 
+# def unit_vector_to_equatorial_radec(vector: np.ndarray) -> Dict[str, float]:
+#     """
+#     Convierte vector cartesiano ICRS a RA, Dec.
+#     """
+
+#     vector = np.asarray(vector, dtype=float)
+#     norm = np.linalg.norm(vector)
+
+#     if norm == 0.0 or not np.isfinite(norm):
+#         raise ValueError("Input vector has zero or invalid norm.")
+
+#     x, y, z = vector / norm
+
+#     cartesian = CartesianRepresentation(
+#         x=x * u.one,
+#         y=y * u.one,
+#         z=z * u.one,
+#     )
+
+#     coord = SkyCoord(
+#         cartesian,
+#         frame="icrs",
+#     )
+
+#     ra_deg = coord.ra.to_value(u.deg)
+#     dec_deg = coord.dec.to_value(u.deg)
+
+#     ra_rad = coord.ra.to_value(u.rad)
+#     dec_rad = coord.dec.to_value(u.rad)
+
+#     return {
+#         "ra_deg": float(ra_deg),
+#         "dec_deg": float(dec_deg),
+#         "ra_rad": float(ra_rad),
+#         "dec_rad": float(dec_rad),
+#     }
 
 def unit_vector_to_equatorial_radec(vector: np.ndarray) -> Dict[str, float]:
     """

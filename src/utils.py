@@ -1961,7 +1961,6 @@ def show_cluster_validation_products_icrs(
         edgecolor="none",
     )
 
-    axes[0].invert_xaxis()
     axes[0].set_xlabel("RA [deg]")
     axes[0].set_ylabel("Dec [deg]")
     axes[0].set_title("Sky distribution")
@@ -2085,7 +2084,6 @@ def show_cluster_validation_products_icrs(
         alpha=0.8,
     )
 
-    axes[1].invert_xaxis()
     axes[1].set_xlabel("RA [deg]")
     axes[1].set_ylabel("Dec [deg]")
     axes[1].set_title("Proper-motion vector field")
@@ -2290,7 +2288,7 @@ def show_cluster_validation_products_icrs(
         alpha=0.85,
         edgecolor="none",
     )
-    axes[0].invert_xaxis()
+    
     axes[0].set_xlabel("RA [deg]")
     axes[0].set_ylabel("Dec [deg]")
     axes[0].set_title("Pole residual across the sky")
@@ -2344,7 +2342,6 @@ def show_cluster_validation_products_icrs(
             label="Reference apex",
         )
 
-        axes[0].invert_xaxis()
         axes[0].set_xlabel(r"$\alpha_{\rm apex}$ [deg]")
         axes[0].set_ylabel(r"$\delta_{\rm apex}$ [deg]")
         axes[0].set_title("Bootstrap apex cloud")
@@ -2650,7 +2647,6 @@ def plot_pm_vectors_on_sky(
     ax1.set_xlabel("RA [deg]")
     ax1.set_ylabel("Dec [deg]")
     ax1.set_title("Observed vs corrected proper-motion vectors")
-    ax1.invert_xaxis()
     ax1.grid(alpha=0.3)
     ax1.legend()
 
@@ -2683,7 +2679,6 @@ def plot_pm_vectors_on_sky(
     ax2.set_xlabel("RA [deg]")
     ax2.set_ylabel("Dec [deg]")
     ax2.set_title("Correction vectors on the sky")
-    ax2.invert_xaxis()
     ax2.grid(alpha=0.3)
     ax2.legend()
 
@@ -2913,3 +2908,389 @@ def plot_pm_correction_diagnostics(
     print()
     print("Mean d_pmra            [mas/yr]:", np.nanmean(data["d_pmra"]))
     print("Mean d_pmdec           [mas/yr]:", np.nanmean(data["d_pmdec"]))
+
+def correct_gaia_proper_motions(
+    df: pd.DataFrame,
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    parallax_col: str = "parallax",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
+    solar_motion_uvw_kms: tuple[float, float, float] = (11.1, 12.24, 7.25),
+    correct_solar_reflex: bool = True,
+    correct_oort_rotation: bool = False,
+    suffix: str = "_corr",
+    copy: bool = True,
+) -> pd.DataFrame:
+    """
+    Corrige movimientos propios de Gaia.
+
+    Esta función toma las columnas astrométricas básicas de Gaia:
+
+        ra        [grados]
+        dec       [grados]
+        parallax  [mas]
+        pmra      [mas/yr] = mu_alpha* = mu_alpha cos(dec)
+        pmdec     [mas/yr]
+
+    y calcula movimientos propios corregidos por:
+
+        1. Movimiento solar reflejo respecto al Local Standard of Rest, LSR.
+
+    La corrección se hace estrella por estrella, porque la proyección del
+    movimiento solar y de la rotación galáctica depende de la posición en el cielo
+    y, en el caso del movimiento solar reflejo, también de la distancia.
+
+    Parámetros
+    ----------
+    df : pandas.DataFrame
+        Tabla con los datos Gaia.
+
+    ra_col, dec_col : str
+        Nombres de las columnas de ascensión recta y declinación en grados.
+
+    parallax_col : str
+        Nombre de la columna de paralaje en milisegundos de arco, mas.
+
+    pmra_col, pmdec_col : str
+        Nombres de las columnas de movimiento propio en ICRS.
+        En Gaia, pmra ya incluye el factor cos(dec):
+            pmra = mu_alpha* = mu_alpha cos(dec)
+
+    solar_motion_uvw_kms : tuple
+        Movimiento solar respecto al LSR en km/s.
+
+        Convención galáctica estándar:
+            U > 0 hacia el centro galáctico
+            V > 0 en la dirección de rotación galáctica
+            W > 0 hacia el polo norte galáctico
+
+        Valor por defecto:
+            (U, V, W) = (11.1, 12.24, 7.25) km/s
+
+    correct_solar_reflex : bool
+        Si True, resta el movimiento solar reflejo de los movimientos propios.
+
+    suffix : str
+        Sufijo para las columnas corregidas.
+        Por defecto se crearán:
+            pmra_corr
+            pmdec_corr
+
+    copy : bool
+        Si True, no modifica el DataFrame original.
+        Si False, añade las columnas directamente sobre df.
+
+    Retorna
+    -------
+    pandas.DataFrame
+        DataFrame con columnas adicionales:
+
+            parallax_corr
+            distance_pc
+
+            l_deg
+            b_deg
+
+            pm_l_cosb
+            pm_b
+
+            mu_l_solar_reflex
+            mu_b_solar_reflex
+
+            pm_l_cosb_corr
+            pm_b_corr
+
+            pmra_corr
+            pmdec_corr
+
+            d_pmra_corr
+            d_pmdec_corr
+
+            pm_corr_valid
+
+    Uso típico
+    ----------
+    df_corr = correct_gaia_proper_motions(df)
+
+    Luego usas:
+
+        pmra_col  = "pmra_corr"
+        pmdec_col = "pmdec_corr"
+
+    """
+
+    # ------------------------------------------------------------------
+    # 1. Verificar que el DataFrame tiene las columnas necesarias
+    # ------------------------------------------------------------------
+
+    required = [ra_col, dec_col, parallax_col, pmra_col, pmdec_col]
+    missing = set(required).difference(df.columns)
+
+    if missing:
+        raise ValueError(f"Faltan columnas requeridas: {sorted(missing)}")
+
+    # Si copy=True, trabajamos sobre una copia para no alterar el DataFrame original.
+    # Si copy=False, añadimos columnas directamente sobre df.
+    result = df.copy() if copy else df
+
+    # Convertimos columnas a arreglos numpy de tipo float.
+    # Esto acelera las operaciones y evita problemas con tipos mixtos.
+    ra = result[ra_col].to_numpy(dtype=float)
+    dec = result[dec_col].to_numpy(dtype=float)
+    parallax_obs = result[parallax_col].to_numpy(dtype=float)
+    pmra = result[pmra_col].to_numpy(dtype=float)
+    pmdec = result[pmdec_col].to_numpy(dtype=float)
+
+    parallax_corr = parallax_obs
+
+    # ------------------------------------------------------------------
+    # 3. Máscara de estrellas válidas
+    # ------------------------------------------------------------------
+    #
+    # Solo podemos corregir estrellas con:
+    #   - ra, dec finitos
+    #   - parallax_corr finita y positiva
+    #   - pmra, pmdec finitos
+    #
+    # Si parallax <= 0, la distancia 1000/parallax no tiene sentido físico
+    # en este esquema simple.
+    # ------------------------------------------------------------------
+
+    valid = (
+        np.isfinite(ra)
+        & np.isfinite(dec)
+        & np.isfinite(parallax_corr)
+        & np.isfinite(pmra)
+        & np.isfinite(pmdec)
+        & (parallax_corr > 0.0)
+    )
+
+    if valid.sum() == 0:
+        raise ValueError("No hay estrellas válidas con parallax > 0 y PM finitos.")
+
+    n = len(result)
+
+    # ------------------------------------------------------------------
+    # 4. Crear arreglos de salida llenos inicialmente con NaN
+    # ------------------------------------------------------------------
+    #
+    # Para las estrellas no válidas se dejarán NaN.
+    # Para las válidas se rellenarán los valores corregidos.
+    # ------------------------------------------------------------------
+
+    distance_pc = np.full(n, np.nan)
+
+    l_deg = np.full(n, np.nan)
+    b_deg = np.full(n, np.nan)
+
+    pm_l_cosb = np.full(n, np.nan)
+    pm_b = np.full(n, np.nan)
+
+    pm_l_cosb_corr = np.full(n, np.nan)
+    pm_b_corr = np.full(n, np.nan)
+
+    pmra_corr = np.full(n, np.nan)
+    pmdec_corr = np.full(n, np.nan)
+
+    mu_l_solar = np.full(n, np.nan)
+    mu_b_solar = np.full(n, np.nan)
+
+    # ------------------------------------------------------------------
+    # 5. Calcular distancia en pc
+    # ------------------------------------------------------------------
+
+    distance_pc_valid = 1000.0 / parallax_corr[valid]
+    distance_pc[valid] = distance_pc_valid
+
+    # ------------------------------------------------------------------
+    # 6. Crear objeto SkyCoord en coordenadas ICRS
+    # ------------------------------------------------------------------
+    #
+    # Gaia entrega:
+    #     ra, dec, pmra, pmdec
+    #
+    # en el sistema ecuatorial ICRS.
+
+    c_icrs = SkyCoord(
+        ra=ra[valid] * u.deg,
+        dec=dec[valid] * u.deg,
+        distance=distance_pc_valid * u.pc,
+        pm_ra_cosdec=pmra[valid] * u.mas / u.yr,
+        pm_dec=pmdec[valid] * u.mas / u.yr,
+        radial_velocity=np.zeros(valid.sum()) * u.km / u.s,
+        frame="icrs",
+    )
+
+    # ------------------------------------------------------------------
+    # 7. Transformar a coordenadas galácticas
+    # ------------------------------------------------------------------
+    #
+    # En coordenadas galácticas es más natural aplicar:
+    #   - corrección por movimiento solar reflejo
+    #   - corrección por rotación galáctica diferencial
+    #
+    # Astropy devuelve:
+    #     pm_l_cosb = mu_l* = mu_l cos(b)
+    #     pm_b      = mu_b
+    #
+    # en mas/yr.
+    # ------------------------------------------------------------------
+
+    c_gal = c_icrs.galactic
+
+    l = c_gal.l.to_value(u.rad)
+    b = c_gal.b.to_value(u.rad)
+
+    l_deg[valid] = c_gal.l.to_value(u.deg)
+    b_deg[valid] = c_gal.b.to_value(u.deg)
+
+    pm_l_cosb_valid = c_gal.pm_l_cosb.to_value(u.mas / u.yr)
+    pm_b_valid = c_gal.pm_b.to_value(u.mas / u.yr)
+
+    pm_l_cosb[valid] = pm_l_cosb_valid
+    pm_b[valid] = pm_b_valid
+
+    # Estas son las variables que iremos corrigiendo.
+    # Empezamos desde los movimientos propios observados en coordenadas galácticas.
+    pm_l_new = pm_l_cosb_valid.copy()
+    pm_b_new = pm_b_valid.copy()
+
+    # ------------------------------------------------------------------
+    # 8. Corrección por movimiento solar reflejo
+    # ------------------------------------------------------------------
+    #
+    # El Sol se mueve respecto al LSR con velocidad (U, V, W).
+    # Esa velocidad produce un movimiento aparente reflejo en las estrellas.
+    #
+    # Para una estrella que estuviera en reposo respecto al LSR, nosotros
+    # observaríamos un movimiento propio aparente causado por el movimiento
+    # del Sol.
+    #
+    # En coordenadas galácticas, la contribución reflejo es:
+    #
+    #   mu_l_solar =
+    #       parallax / KAPPA * ( U sin(l) - V cos(l) )
+    #
+    #   mu_b_solar =
+    #       parallax / KAPPA *
+    #       ( U cos(l) sin(b) + V sin(l) sin(b) - W cos(b) )
+    #
+    # donde:
+    #     parallax está en mas
+    #     U,V,W están en km/s
+    #     mu queda en mas/yr
+    #
+    # Para obtener el movimiento propio corregido al LSR, restamos esta
+    # contribución:
+    #
+    #     mu_corr = mu_obs - mu_solar_reflex
+    #
+    # ------------------------------------------------------------------
+
+    if correct_solar_reflex:
+        U, V, W = solar_motion_uvw_kms
+
+        mu_l_solar_valid = (
+            parallax_corr[valid]
+            / KM_S_PER_AU_YR
+            * (U * np.sin(l) - V * np.cos(l))
+        )
+
+        mu_b_solar_valid = (
+            parallax_corr[valid]
+            / KM_S_PER_AU_YR
+            * (
+                U * np.cos(l) * np.sin(b)
+                + V * np.sin(l) * np.sin(b)
+                - W * np.cos(b)
+            )
+        )
+
+        # Restamos el movimiento solar reflejo.
+        pm_l_new = pm_l_new - mu_l_solar_valid
+        pm_b_new = pm_b_new - mu_b_solar_valid
+
+        # Guardamos las correcciones aplicadas para inspección posterior.
+        mu_l_solar[valid] = mu_l_solar_valid
+        mu_b_solar[valid] = mu_b_solar_valid
+
+    # Guardamos movimientos propios corregidos en coordenadas galácticas.
+    pm_l_cosb_corr[valid] = pm_l_new
+    pm_b_corr[valid] = pm_b_new
+
+    # ------------------------------------------------------------------
+    # 10. Transformar los movimientos propios corregidos de vuelta a ICRS
+    # ------------------------------------------------------------------
+    #
+    # Tu código de apex probablemente trabaja con:
+    #     ra, dec, pmra, pmdec
+    #
+    # Por eso, después de corregir en coordenadas galácticas, volvemos a ICRS.
+    #
+    # El resultado final será:
+    #     pmra_corr
+    #     pmdec_corr
+    #
+    # con las mismas unidades y convención que Gaia:
+    #     pmra_corr = mu_alpha* = mu_alpha cos(dec)
+    # ------------------------------------------------------------------
+
+    c_gal_corr = SkyCoord(
+        l=c_gal.l,
+        b=c_gal.b,
+        distance=distance_pc_valid * u.pc,
+        pm_l_cosb=pm_l_new * u.mas / u.yr,
+        pm_b=pm_b_new * u.mas / u.yr,
+        radial_velocity=np.zeros(valid.sum()) * u.km / u.s,
+        frame="galactic",
+    )
+
+    c_icrs_corr = c_gal_corr.icrs
+
+    pmra_corr[valid] = c_icrs_corr.pm_ra_cosdec.to_value(u.mas / u.yr)
+    pmdec_corr[valid] = c_icrs_corr.pm_dec.to_value(u.mas / u.yr)
+
+    # ------------------------------------------------------------------
+    # 11. Añadir columnas al DataFrame
+    # ------------------------------------------------------------------
+    #
+    # Además de las columnas finales corregidas, guardamos columnas
+    # intermedias útiles para depurar, graficar y entender qué tan grande
+    # fue cada corrección.
+    # ------------------------------------------------------------------
+
+    result["parallax_corr"] = parallax_corr
+    result["distance_pc"] = distance_pc
+
+    result["l_deg"] = l_deg
+    result["b_deg"] = b_deg
+
+    # Movimientos propios originales, pero expresados en coordenadas galácticas.
+    result["pm_l_cosb"] = pm_l_cosb
+    result["pm_b"] = pm_b
+
+    # Contribución del movimiento solar reflejo.
+    result["mu_l_solar_reflex"] = mu_l_solar
+    result["mu_b_solar_reflex"] = mu_b_solar
+    
+    # Movimientos propios corregidos en coordenadas galácticas.
+    result["pm_l_cosb_corr"] = pm_l_cosb_corr
+    result["pm_b_corr"] = pm_b_corr
+
+    # Movimientos propios corregidos en coordenadas ecuatoriales ICRS.
+    # Estas son las columnas principales para tu código de apex/antapex.
+    result[f"{pmra_col}{suffix}"] = pmra_corr
+    result[f"{pmdec_col}{suffix}"] = pmdec_corr
+
+    # Diferencia entre el movimiento propio corregido y el observado.
+    # Sirve para ver cuánto cambió cada estrella.
+    result[f"d_{pmra_col}{suffix}"] = result[f"{pmra_col}{suffix}"] - result[pmra_col]
+    result[f"d_{pmdec_col}{suffix}"] = result[f"{pmdec_col}{suffix}"] - result[pmdec_col]
+
+    # Bandera booleana:
+    # True  -> la estrella tenía datos válidos y fue corregida.
+    # False -> la estrella tenía datos inválidos y queda con NaN en las columnas corregidas.
+    result["pm_corr_valid"] = valid
+
+    return result
