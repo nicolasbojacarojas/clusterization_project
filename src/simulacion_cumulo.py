@@ -32,6 +32,35 @@ o en coordenadas galácticas:
 Para cada dirección debe darse exactamente un sistema de coordenadas.
 Si se pasan ambos sistemas para el centro o para el ápex, el código lanza
 un error para evitar ambigüedades.
+
+Este simulador incluye un modelo Gaia-like para errores en movimientos propios:
+
+    pmra_error_distribution = "constant"
+    pmra_error_distribution = "log10_triangular"
+
+En el segundo caso:
+
+    x ~ Triangular(left, mode, right)
+    pmra_error = 10**x
+
+Por defecto:
+
+    x ~ Triangular(-3.0, -1.7, 0.0)
+
+lo cual genera pmra_error entre 0.001 y 1.0 mas/yr, con modo cercano a
+10**(-1.7) ~ 0.02 mas/yr.
+
+También permite imponer una relación empírica:
+
+    pmdec_error = pm_error_slope * pmra_error
+
+por ejemplo:
+
+    pm_error_slope = 0.7
+
+y una correlación astrométrica entre las perturbaciones:
+
+    pmra_pmdec_corr
 """
 
 from __future__ import annotations
@@ -90,10 +119,46 @@ class ClusterSimulationConfig:
     # Error común para pmra y pmdec, por compatibilidad
     proper_motion_error_masyr: float = 0.0
 
-    # Errores separados opcionales para movimiento propio
+    # Errores separados opcionales para movimiento propio.
+    # Si pmra_error_distribution="log10_triangular", pmra_error_masyr
+    # no se usa para pmra.
     pmra_error_masyr: Optional[float] = None
     pmdec_error_masyr: Optional[float] = None
 
+    # Modelo para generar pmra_error estrella-a-estrella.
+    # "constant": usa pmra_error_masyr o proper_motion_error_masyr.
+    # "log10_triangular": x ~ Triangular(left, mode, right),
+    #                     pmra_error = 10**x.
+    pmra_error_distribution: Literal[
+        "constant",
+        "log10_triangular",
+    ] = "constant"
+
+    # Parámetros de la distribución triangular en log10(pmra_error).
+    # Por defecto: rango [-3, 0], centrado en -1.7.
+    pmra_error_log10_left: float = -3.0
+    pmra_error_log10_mode: float = -1.7
+    pmra_error_log10_right: float = 0.0
+
+    # Modelo empírico:
+    # sigma_pmdec = pm_error_slope * sigma_pmra
+    # Útil para aproximar relaciones como pendiente ~0.7.
+    # Solo se usa si pmdec_error_masyr is None.
+    pm_error_slope: Optional[float] = None
+
+    # Correlación Gaia entre las perturbaciones de pmra y pmdec.
+    # No es la pendiente entre errores; es la correlación de la normal bivariada.
+    pmra_pmdec_corr: float = 0.0
+
+    # Dispersión estrella-a-estrella adicional de los errores.
+    # Si es >0, multiplica pmra_error y pmdec_error por un factor lognormal común.
+    proper_motion_error_logscatter: float = 0.0
+
+    # Dispersión adicional alrededor de la relación lineal:
+    # pmdec_error ~ pm_error_slope * pmra_error.
+    pm_error_slope_logscatter: float = 0.0
+
+    # Error de posición en mas
     position_error_mas: float = 0.0
 
     seed: Optional[int] = None
@@ -135,7 +200,8 @@ class OpenClusterSimulator:
             - pmra
             - pmdec
 
-            También incluye columnas verdaderas y diagnósticas.
+            También incluye columnas verdaderas, errores observacionales
+            y diagnósticas.
         """
 
         positions_pc = self._build_cluster_positions()
@@ -229,6 +295,10 @@ class OpenClusterSimulator:
             "parallax_error_mas": config.parallax_error_mas,
             "proper_motion_error_masyr": config.proper_motion_error_masyr,
             "position_error_mas": config.position_error_mas,
+            "proper_motion_error_logscatter": (
+                config.proper_motion_error_logscatter
+            ),
+            "pm_error_slope_logscatter": config.pm_error_slope_logscatter,
         }
 
         optional_sigma_values = {
@@ -243,6 +313,34 @@ class OpenClusterSimulator:
         for name, value in optional_sigma_values.items():
             if value is not None and value < 0.0:
                 raise ValueError(f"{name} must be non-negative.")
+
+        if config.pmra_error_distribution not in {
+            "constant",
+            "log10_triangular",
+        }:
+            raise ValueError(
+                "pmra_error_distribution must be either "
+                "'constant' or 'log10_triangular'."
+            )
+
+        if config.pmra_error_distribution == "log10_triangular":
+            left = config.pmra_error_log10_left
+            mode = config.pmra_error_log10_mode
+            right = config.pmra_error_log10_right
+
+            if not left <= mode <= right:
+                raise ValueError(
+                    "For pmra_error_distribution='log10_triangular', "
+                    "the parameters must satisfy: "
+                    "pmra_error_log10_left <= pmra_error_log10_mode "
+                    "<= pmra_error_log10_right."
+                )
+
+        if config.pm_error_slope is not None and config.pm_error_slope <= 0.0:
+            raise ValueError("pm_error_slope must be positive if provided.")
+
+        if not -1.0 <= config.pmra_pmdec_corr <= 1.0:
+            raise ValueError("pmra_pmdec_corr must be between -1 and 1.")
 
     @staticmethod
     def _validate_coordinate_choice(
@@ -617,6 +715,123 @@ class OpenClusterSimulator:
             }
         )
 
+    def _build_proper_motion_error_model(
+        self,
+        n_sources: int,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Construye errores Gaia-like para pmra y pmdec.
+
+        Para pmra permite dos modelos:
+
+        1. constant:
+           sigma_pmra = pmra_error_masyr o proper_motion_error_masyr
+
+        2. log10_triangular:
+           x ~ Triangular(left, mode, right)
+           sigma_pmra = 10**x
+
+        Para pmdec permite:
+
+        - usar pmdec_error_masyr si está definido;
+        - usar sigma_pmdec = pm_error_slope * sigma_pmra;
+        - usar proper_motion_error_masyr como fallback.
+
+        La correlación pmra_pmdec_corr controla la correlación entre las
+        perturbaciones aleatorias, no la pendiente entre errores.
+        """
+
+        config = self.config
+
+        # ------------------------------------------------------------
+        # Error en pmra
+        # ------------------------------------------------------------
+
+        if config.pmra_error_distribution == "log10_triangular":
+            log10_pmra_error = self.rng.triangular(
+                left=config.pmra_error_log10_left,
+                mode=config.pmra_error_log10_mode,
+                right=config.pmra_error_log10_right,
+                size=n_sources,
+            )
+
+            pmra_error = 10.0 ** log10_pmra_error
+
+        elif config.pmra_error_distribution == "constant":
+            base_pmra_error = (
+                config.pmra_error_masyr
+                if config.pmra_error_masyr is not None
+                else config.proper_motion_error_masyr
+            )
+
+            pmra_error = np.full(
+                n_sources,
+                base_pmra_error,
+                dtype=float,
+            )
+
+        else:
+            raise ValueError(
+                "Unsupported pmra_error_distribution: "
+                f"{config.pmra_error_distribution}"
+            )
+
+        # ------------------------------------------------------------
+        # Error en pmdec
+        # ------------------------------------------------------------
+
+        if config.pmdec_error_masyr is not None:
+            pmdec_error = np.full(
+                n_sources,
+                config.pmdec_error_masyr,
+                dtype=float,
+            )
+
+        elif config.pm_error_slope is not None:
+            pmdec_error = config.pm_error_slope * pmra_error
+
+        else:
+            pmdec_error = np.full(
+                n_sources,
+                config.proper_motion_error_masyr,
+                dtype=float,
+            )
+
+        # ------------------------------------------------------------
+        # Dispersión adicional opcional
+        # ------------------------------------------------------------
+
+        if config.proper_motion_error_logscatter > 0.0:
+            common_factor = np.exp(
+                self.rng.normal(
+                    loc=0.0,
+                    scale=config.proper_motion_error_logscatter,
+                    size=n_sources,
+                )
+            )
+
+            pmra_error *= common_factor
+            pmdec_error *= common_factor
+
+        if config.pm_error_slope_logscatter > 0.0:
+            slope_factor = np.exp(
+                self.rng.normal(
+                    loc=0.0,
+                    scale=config.pm_error_slope_logscatter,
+                    size=n_sources,
+                )
+            )
+
+            pmdec_error *= slope_factor
+
+        corr = np.full(
+            n_sources,
+            np.clip(config.pmra_pmdec_corr, -0.999, 0.999),
+            dtype=float,
+        )
+
+        return pmra_error, pmdec_error, corr
+
     def _apply_observational_noise(
         self,
         catalog: pd.DataFrame,
@@ -624,29 +839,44 @@ class OpenClusterSimulator:
         """
         Aplica ruido observacional gaussiano a las columnas tipo Gaia.
 
-        Permite errores separados para pmra y pmdec si existen en la
-        configuración:
+        Para movimientos propios usa una normal bivariada:
 
-            pmra_error_masyr
-            pmdec_error_masyr
+            [dpmra, dpmdec] ~ N(0, C)
 
-        Si esos valores son None, usa el error común:
+        donde:
 
-            proper_motion_error_masyr
+            C = [[sigma_pmra^2,
+                  rho sigma_pmra sigma_pmdec],
+                 [rho sigma_pmra sigma_pmdec,
+                  sigma_pmdec^2]]
 
-        Parameters
-        ----------
-        catalog : pd.DataFrame
-            Catálogo sin ruido observacional.
-
-        Returns
-        -------
-        pd.DataFrame
-            Catálogo con ruido observacional.
+        La relación empírica sigma_pmdec ~ 0.7 sigma_pmra puede activarse
+        con pm_error_slope=0.7.
         """
 
         config = self.config
         result = catalog.copy()
+        n_sources = len(result)
+
+        # ------------------------------------------------------------
+        # Guardar errores observacionales tipo Gaia
+        # ------------------------------------------------------------
+
+        result["ra_error"] = config.position_error_mas
+        result["dec_error"] = config.position_error_mas
+        result["parallax_error"] = config.parallax_error_mas
+
+        pmra_error, pmdec_error, pm_corr = self._build_proper_motion_error_model(
+            n_sources=n_sources,
+        )
+
+        result["pmra_error"] = pmra_error
+        result["pmdec_error"] = pmdec_error
+        result["pmra_pmdec_corr"] = pm_corr
+
+        # ------------------------------------------------------------
+        # Ruido en posición
+        # ------------------------------------------------------------
 
         if config.position_error_mas > 0.0:
             sigma_deg = config.position_error_mas / 3_600_000.0
@@ -654,114 +884,70 @@ class OpenClusterSimulator:
             result["ra"] += self.rng.normal(
                 loc=0.0,
                 scale=sigma_deg,
-                size=len(result),
+                size=n_sources,
             )
 
             result["dec"] += self.rng.normal(
                 loc=0.0,
                 scale=sigma_deg,
-                size=len(result),
+                size=n_sources,
             )
 
             result["ra"] = np.mod(result["ra"], 360.0)
             result["dec"] = np.clip(result["dec"], -90.0, 90.0)
 
+        # ------------------------------------------------------------
+        # Ruido en paralaje
+        # ------------------------------------------------------------
+
         if config.parallax_error_mas > 0.0:
             result["parallax"] += self.rng.normal(
                 loc=0.0,
                 scale=config.parallax_error_mas,
-                size=len(result),
+                size=n_sources,
             )
 
-        pmra_error_masyr = (
-            config.pmra_error_masyr
-            if config.pmra_error_masyr is not None
-            else config.proper_motion_error_masyr
-        )
+        # ------------------------------------------------------------
+        # Ruido correlacionado en movimientos propios
+        # ------------------------------------------------------------
 
-        pmdec_error_masyr = (
-            config.pmdec_error_masyr
-            if config.pmdec_error_masyr is not None
-            else config.proper_motion_error_masyr
-        )
+        has_pm_noise = np.any(pmra_error > 0.0) or np.any(pmdec_error > 0.0)
 
-        if pmra_error_masyr > 0.0:
-            result["pmra"] += self.rng.normal(
-                loc=0.0,
-                scale=pmra_error_masyr,
-                size=len(result),
+        if has_pm_noise:
+            z1 = self.rng.normal(size=n_sources)
+            z2 = self.rng.normal(size=n_sources)
+
+            delta_pmra = pmra_error * z1
+
+            delta_pmdec = pmdec_error * (
+                pm_corr * z1
+                + np.sqrt(1.0 - pm_corr**2) * z2
             )
 
-        if pmdec_error_masyr > 0.0:
-            result["pmdec"] += self.rng.normal(
-                loc=0.0,
-                scale=pmdec_error_masyr,
-                size=len(result),
-            )
+            result["pmra"] += delta_pmra
+            result["pmdec"] += delta_pmdec
 
         return result
 
 
-# if __name__ == "__main__":
+if __name__ == "__main__":
     # ============================================================
-    # EJEMPLO 1:
-    # Centro en coordenadas ecuatoriales ICRS.
-    # Ápex en coordenadas galácticas.
-    # ============================================================
-
-    # config = ClusterSimulationConfig(
-    #     n_members=455,
-    #     center_ra_deg=90.0,
-    #     center_dec_deg=0.0,
-    #     distance_pc=85.0,
-    #     radius_pc=5.0,
-    #     apex_l_deg=123.0,
-    #     apex_b_deg=27.0,
-    #     speed_kms=25.0,
-    #     speed_sigma_kms=0.0,
-    #     apex_l_sigma_deg=0.0,
-    #     apex_b_sigma_deg=0.0,
-    #     parallax_error_mas=0.0,
-    #     proper_motion_error_masyr=0.0,
-    #     position_error_mas=0.0,
-    #     seed=42,
-    #     include_true_values=True,
-    # )
-
-    # ============================================================
-    # EJEMPLO 2:
+    # EJEMPLO:
     # Centro en coordenadas galácticas.
     # Ápex en coordenadas ecuatoriales ICRS.
     #
-    # Para usar este ejemplo, comenta el config anterior y
-    # descomenta este bloque.
+    # Errores:
+    #   log10(pmra_error) ~ Triangular(-3, -1.7, 0)
+    #   pmdec_error ~ 0.7 * pmra_error
+    #   perturbaciones pmra/pmdec correlacionadas con rho = 0.2
     # ============================================================
 
     # config = ClusterSimulationConfig(
     #     n_members=455,
+
+    #     # Centro del cúmulo en galácticas
     #     center_l_deg=221.0,
     #     center_b_deg=84.0,
-    #     distance_pc=85.0,
-    #     radius_pc=5.0,
-    #     apex_ra_deg=180.0,
-    #     apex_dec_deg=30.0,
-    #     speed_kms=25.0,
-    #     speed_sigma_kms=0.0,
-    #     apex_l_sigma_deg=0.0,
-    #     apex_b_sigma_deg=0.0,
-    #     parallax_error_mas=0.0,
-    #     proper_motion_error_masyr=0.0,
-    #     position_error_mas=0.0,
-    #     seed=42,
-    #     include_true_values=True,
-    # )
-
-    # config = ClusterSimulationConfig(
-    #     n_members=455,
-
-    #     # Centro del cúmulo en ecuatoriales ICRS
-    #     center_ra_deg=90.0,
-    #     center_dec_deg=0.0,
 
     #     distance_pc=85.0,
     #     radius_pc=5.0,
@@ -771,30 +957,33 @@ class OpenClusterSimulator:
     #     apex_dec_deg=30.0,
 
     #     speed_kms=25.0,
-    #     speed_sigma_kms=0.0,
+    #     speed_sigma_kms=0.5,
 
-    #     # En este caso estas sigmas se interpretan como:
-    #     # apex_l_sigma_deg -> sigma_RA
-    #     # apex_b_sigma_deg -> sigma_Dec
     #     apex_l_sigma_deg=0.0,
     #     apex_b_sigma_deg=0.0,
 
-    #     parallax_error_mas=0.0,
-    #     proper_motion_error_masyr=0.0,
-    #     position_error_mas=0.0,
+    #     parallax_error_mas=0.02,
+
+    #     # Modelo triangular en log10 para pmra_error
+    #     pmra_error_distribution="log10_triangular",
+    #     pmra_error_log10_left=-3.0,
+    #     pmra_error_log10_mode=-1.7,
+    #     pmra_error_log10_right=0.0,
+
+    #     # Relación empírica:
+    #     # pmdec_error ≈ 0.7 * pmra_error
+    #     pm_error_slope=0.7,
+
+    #     # Correlación entre las perturbaciones de pmra y pmdec
+    #     pmra_pmdec_corr=0.2,
+
+    #     # Dispersión opcional alrededor de la pendiente 0.7
+    #     pm_error_slope_logscatter=0.08,
+
+    #     position_error_mas=0.1,
 
     #     seed=42,
     #     include_true_values=True,
-    # )
-
-    # simulator = OpenClusterSimulator(config)
-    # catalog = simulator.simulate()
-
-    # print(catalog.head())
-
-    # catalog.to_csv(
-    #     "mock_open_cluster_gaia_equatorial_only.csv",
-    #     index=False,
     # )
 
     # simulator = OpenClusterSimulator(config)
