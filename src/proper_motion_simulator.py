@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -102,6 +102,64 @@ def apex_to_icrs_velocity(
     return speed_kms * apex_vector
 
 
+def _validate_triangular_log_error(
+    name: str,
+    log_error_range: Tuple[float, float],
+    log_error_center: float,
+) -> None:
+    """
+    Valida parámetros de una distribución triangular en log10(error).
+    """
+
+    log_min, log_max = log_error_range
+
+    if log_min > log_max:
+        raise ValueError(
+            f"{name}_log_error_range debe satisfacer min <= max."
+        )
+
+    if not log_min <= log_error_center <= log_max:
+        raise ValueError(
+            f"{name}_log_error_center debe estar entre "
+            f"{name}_log_error_range[0] y {name}_log_error_range[1]."
+        )
+
+
+def _draw_log10_triangular_error(
+    rng: np.random.Generator,
+    n_stars: int,
+    log_error_range: Tuple[float, float],
+    log_error_center: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Dibuja errores desde:
+
+        x ~ Triangular(left, mode, right)
+        sigma = 10**x
+
+    Returns
+    -------
+    log_error : np.ndarray
+        Valores de log10(sigma).
+
+    error : np.ndarray
+        Valores de sigma en escala lineal.
+    """
+
+    log_min, log_max = log_error_range
+
+    log_error = rng.triangular(
+        left=log_min,
+        mode=log_error_center,
+        right=log_max,
+        size=n_stars,
+    )
+
+    error = 10.0 ** log_error
+
+    return log_error, error
+
+
 def simulate_proper_motions_from_3d_velocity(
     df: pd.DataFrame,
 
@@ -120,18 +178,49 @@ def simulate_proper_motions_from_3d_velocity(
     dec_col: str = "dec",
     parallax_col: str = "parallax",
 
-    pmra_log_error_range: Tuple[float, float] = (-2.0, 0.0),
-    pmra_log_error_center: float = -1.0,
+    # ------------------------------------------------------------
+    # Modelo de error para pmra
+    # Por defecto:
+    # log10(pmra_error) ~ Triangular(-3, -1.7, 0)
+    # ------------------------------------------------------------
+    pmra_log_error_range: Tuple[float, float] = (-3.0, 0.0),
+    pmra_log_error_center: float = -1.7,
 
-    pmdec_log_error_range: Tuple[float, float] = (-2.0, 0.0),
-    pmdec_log_error_center: float = -1.0,
+    # ------------------------------------------------------------
+    # Modelo de error para pmdec
+    #
+    # "scaled_pmra":
+    #     pmdec_error = pm_error_slope * pmra_error
+    #
+    # "independent_log10_triangular":
+    #     log10(pmdec_error) se genera con su propia triangular.
+    # ------------------------------------------------------------
+    pmdec_error_model: Literal[
+        "scaled_pmra",
+        "independent_log10_triangular",
+    ] = "scaled_pmra",
 
-    parallax_log_error_range: Tuple[float, float] = (-2.0, 0.0),
-    parallax_log_error_center: float = -1.0,
+    pm_error_slope: float = 0.7,
+    pm_error_slope_logscatter: float = 0.0,
+
+    pmdec_log_error_range: Tuple[float, float] = (-3.0, 0.0),
+    pmdec_log_error_center: float = -1.7,
+
+    # Correlación entre las perturbaciones aleatorias de pmra y pmdec.
+    # No es la pendiente entre pmra_error y pmdec_error.
+    pmra_pmdec_corr: float = 0.2,
+
+    # ------------------------------------------------------------
+    # Modelo de error de paralaje
+    # Solo se genera si apply_parallax_error=True.
+    # ------------------------------------------------------------
+    parallax_log_error_range: Tuple[float, float] = (-3.0, 0.0),
+    parallax_log_error_center: float = -1.7,
 
     apply_pmra_error: bool = True,
     apply_pmdec_error: bool = True,
     apply_parallax_error: bool = False,
+
     seed: Optional[int] = None,
     copy: bool = True,
 ) -> pd.DataFrame:
@@ -152,6 +241,21 @@ def simulate_proper_motions_from_3d_velocity(
     Gaia usa:
         pmra  = mu_alpha* = mu_alpha cos(dec)
         pmdec = mu_delta
+
+    Modelo Gaia-like de errores en movimiento propio:
+
+        log10(pmra_error) ~ Triangular(-3, -1.7, 0)
+
+    y, por defecto:
+
+        pmdec_error = 0.7 * pmra_error
+
+    Las perturbaciones de pmra y pmdec se generan con una normal bivariada
+    usando pmra_pmdec_corr.
+
+    Los errores solo se generan y aplican si apply_pmra_error=True o
+    apply_pmdec_error=True. Si ambos son False, el cúmulo queda perfecto
+    en movimientos propios.
     """
 
     required = [ra_col, dec_col]
@@ -199,6 +303,53 @@ def simulate_proper_motions_from_3d_velocity(
             "Debes definir la velocidad con apex_ra_deg, apex_dec_deg, "
             "speed_kms o con u_kms, v_kms, w_kms."
         )
+
+    # ------------------------------------------------------------
+    # Validación de parámetros de errores
+    # ------------------------------------------------------------
+
+    if apply_pmra_error or apply_pmdec_error:
+        _validate_triangular_log_error(
+            name="pmra",
+            log_error_range=pmra_log_error_range,
+            log_error_center=pmra_log_error_center,
+        )
+
+        if pmdec_error_model not in {
+            "scaled_pmra",
+            "independent_log10_triangular",
+        }:
+            raise ValueError(
+                "pmdec_error_model debe ser 'scaled_pmra' o "
+                "'independent_log10_triangular'."
+            )
+
+        if pmdec_error_model == "independent_log10_triangular":
+            _validate_triangular_log_error(
+                name="pmdec",
+                log_error_range=pmdec_log_error_range,
+                log_error_center=pmdec_log_error_center,
+            )
+
+        if pm_error_slope <= 0.0:
+            raise ValueError("pm_error_slope debe ser positivo.")
+
+        if pm_error_slope_logscatter < 0.0:
+            raise ValueError("pm_error_slope_logscatter debe ser >= 0.")
+
+        if not -1.0 <= pmra_pmdec_corr <= 1.0:
+            raise ValueError("pmra_pmdec_corr debe estar entre -1 y 1.")
+
+    if apply_parallax_error:
+        _validate_triangular_log_error(
+            name="parallax",
+            log_error_range=parallax_log_error_range,
+            log_error_center=parallax_log_error_center,
+        )
+
+    # ------------------------------------------------------------
+    # Construcción del vector de velocidad ICRS
+    # ------------------------------------------------------------
 
     if apex_complete:
         velocity_mode = "apex"
@@ -259,32 +410,25 @@ def simulate_proper_motions_from_3d_velocity(
 
     # ------------------------------------------------------------
     # Errores de paralaje
+    # Solo se generan si apply_parallax_error=True
     # ------------------------------------------------------------
 
-    parallax_log_min, parallax_log_max = parallax_log_error_range
-
-    if not (parallax_log_min <= parallax_log_error_center <= parallax_log_max):
-        raise ValueError(
-            "parallax_log_error_center debe estar entre "
-            "parallax_log_error_range[0] y parallax_log_error_range[1]."
+    if apply_parallax_error:
+        parallax_log_error, parallax_error_mas = _draw_log10_triangular_error(
+            rng=rng,
+            n_stars=n_stars,
+            log_error_range=parallax_log_error_range,
+            log_error_center=parallax_log_error_center,
         )
 
-    parallax_log_error = rng.triangular(
-        left=parallax_log_min,
-        mode=parallax_log_error_center,
-        right=parallax_log_max,
-        size=n_stars,
-    )
-
-    parallax_error_mas = 10.0 ** parallax_log_error
-
-    if apply_parallax_error:
         parallax_noise_mas = rng.normal(
             loc=0.0,
             scale=parallax_error_mas,
             size=n_stars,
         )
     else:
+        parallax_log_error = np.full(n_stars, np.nan, dtype=float)
+        parallax_error_mas = np.zeros(n_stars, dtype=float)
         parallax_noise_mas = np.zeros(n_stars, dtype=float)
 
     parallax_observed = parallax_true + parallax_noise_mas
@@ -402,65 +546,101 @@ def simulate_proper_motions_from_3d_velocity(
     result["pmdec_true"] = pmdec_true
 
     # ------------------------------------------------------------
-    # Errores de movimientos propios
-    # Distribución triangular en log10(sigma)
+    # Errores de movimientos propios Gaia-like
+    #
+    # Solo se generan si apply_pmra_error=True o apply_pmdec_error=True.
+    #
+    # pmra:
+    #   log10(pmra_error) ~ Triangular(-3, -1.7, 0)
+    #
+    # pmdec por defecto:
+    #   pmdec_error = 0.7 * pmra_error
+    #
+    # Ruido:
+    #   normal bivariada con correlación pmra_pmdec_corr
     # ------------------------------------------------------------
 
-    pmra_log_min, pmra_log_max = pmra_log_error_range
-    pmdec_log_min, pmdec_log_max = pmdec_log_error_range
-
-    if not (pmra_log_min <= pmra_log_error_center <= pmra_log_max):
-        raise ValueError(
-            "pmra_log_error_center debe estar entre "
-            "pmra_log_error_range[0] y pmra_log_error_range[1]."
+    if apply_pmra_error or apply_pmdec_error:
+        pmra_log_error, pmra_error_masyr = _draw_log10_triangular_error(
+            rng=rng,
+            n_stars=n_stars,
+            log_error_range=pmra_log_error_range,
+            log_error_center=pmra_log_error_center,
         )
 
-    if not (pmdec_log_min <= pmdec_log_error_center <= pmdec_log_max):
-        raise ValueError(
-            "pmdec_log_error_center debe estar entre "
-            "pmdec_log_error_range[0] y pmdec_log_error_range[1]."
+        if pmdec_error_model == "scaled_pmra":
+            pmdec_error_masyr = pm_error_slope * pmra_error_masyr
+
+            if pm_error_slope_logscatter > 0.0:
+                slope_factor = np.exp(
+                    rng.normal(
+                        loc=0.0,
+                        scale=pm_error_slope_logscatter,
+                        size=n_stars,
+                    )
+                )
+
+                pmdec_error_masyr *= slope_factor
+
+            pmdec_log_error = np.log10(pmdec_error_masyr)
+
+        elif pmdec_error_model == "independent_log10_triangular":
+            pmdec_log_error, pmdec_error_masyr = (
+                _draw_log10_triangular_error(
+                    rng=rng,
+                    n_stars=n_stars,
+                    log_error_range=pmdec_log_error_range,
+                    log_error_center=pmdec_log_error_center,
+                )
+            )
+
+        else:
+            raise ValueError(
+                "pmdec_error_model debe ser 'scaled_pmra' o "
+                "'independent_log10_triangular'."
+            )
+
+        rho = np.clip(pmra_pmdec_corr, -0.999, 0.999)
+
+        z1 = rng.normal(size=n_stars)
+        z2 = rng.normal(size=n_stars)
+
+        pmra_noise_candidate = pmra_error_masyr * z1
+
+        pmdec_noise_candidate = pmdec_error_masyr * (
+            rho * z1 + np.sqrt(1.0 - rho**2) * z2
         )
 
-    pmra_log_error = rng.triangular(
-        left=pmra_log_min,
-        mode=pmra_log_error_center,
-        right=pmra_log_max,
-        size=n_stars,
-    )
+        if apply_pmra_error:
+            pmra_noise_masyr = pmra_noise_candidate
+        else:
+            pmra_noise_masyr = np.zeros(n_stars, dtype=float)
 
-    pmdec_log_error = rng.triangular(
-        left=pmdec_log_min,
-        mode=pmdec_log_error_center,
-        right=pmdec_log_max,
-        size=n_stars,
-    )
+        if apply_pmdec_error:
+            pmdec_noise_masyr = pmdec_noise_candidate
+        else:
+            pmdec_noise_masyr = np.zeros(n_stars, dtype=float)
 
-    pmra_error_masyr = 10.0 ** pmra_log_error
-    pmdec_error_masyr = 10.0 ** pmdec_log_error
+        pm_corr_array = np.full(n_stars, rho, dtype=float)
 
-    if apply_pmra_error:
-        pmra_noise_masyr = rng.normal(
-            loc=0.0,
-            scale=pmra_error_masyr,
-            size=n_stars,
-        )
     else:
+        pmra_log_error = np.full(n_stars, np.nan, dtype=float)
+        pmdec_log_error = np.full(n_stars, np.nan, dtype=float)
+
+        pmra_error_masyr = np.zeros(n_stars, dtype=float)
+        pmdec_error_masyr = np.zeros(n_stars, dtype=float)
+
         pmra_noise_masyr = np.zeros(n_stars, dtype=float)
-
-    if apply_pmdec_error:
-        pmdec_noise_masyr = rng.normal(
-            loc=0.0,
-            scale=pmdec_error_masyr,
-            size=n_stars,
-        )
-    else:
         pmdec_noise_masyr = np.zeros(n_stars, dtype=float)
+
+        pm_corr_array = np.zeros(n_stars, dtype=float)
 
     result["pmra_log_error"] = pmra_log_error
     result["pmdec_log_error"] = pmdec_log_error
 
     result["pmra_error_masyr"] = pmra_error_masyr
     result["pmdec_error_masyr"] = pmdec_error_masyr
+    result["pmra_pmdec_corr"] = pm_corr_array
 
     result["pmra_noise_masyr"] = pmra_noise_masyr
     result["pmdec_noise_masyr"] = pmdec_noise_masyr

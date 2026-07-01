@@ -942,56 +942,56 @@ if __name__ == "__main__":
     #   perturbaciones pmra/pmdec correlacionadas con rho = 0.2
     # ============================================================
 
-    # config = ClusterSimulationConfig(
-    #     n_members=455,
+    config = ClusterSimulationConfig(
+        n_members=455,
 
-    #     # Centro del cúmulo en galácticas
-    #     center_l_deg=221.0,
-    #     center_b_deg=84.0,
+        # Centro del cúmulo en galácticas
+        center_l_deg=221.0,
+        center_b_deg=84.0,
 
-    #     distance_pc=85.0,
-    #     radius_pc=5.0,
+        distance_pc=85.0,
+        radius_pc=5.0,
 
-    #     # Ápex en ecuatoriales ICRS
-    #     apex_ra_deg=180.0,
-    #     apex_dec_deg=30.0,
+        # Ápex en ecuatoriales ICRS
+        apex_ra_deg=180.0,
+        apex_dec_deg=30.0,
 
-    #     speed_kms=25.0,
-    #     speed_sigma_kms=0.5,
+        speed_kms=25.0,
+        speed_sigma_kms=0.5,
 
-    #     apex_l_sigma_deg=0.0,
-    #     apex_b_sigma_deg=0.0,
+        apex_l_sigma_deg=0.0,
+        apex_b_sigma_deg=0.0,
 
-    #     parallax_error_mas=0.02,
+        parallax_error_mas=0.02,
 
-    #     # Modelo triangular en log10 para pmra_error
-    #     pmra_error_distribution="log10_triangular",
-    #     pmra_error_log10_left=-3.0,
-    #     pmra_error_log10_mode=-1.7,
-    #     pmra_error_log10_right=0.0,
+        # Modelo triangular en log10 para pmra_error
+        pmra_error_distribution="log10_triangular",
+        pmra_error_log10_left=-3.0,
+        pmra_error_log10_mode=-1.7,
+        pmra_error_log10_right=0.0,
 
-    #     # Relación empírica:
-    #     # pmdec_error ≈ 0.7 * pmra_error
-    #     pm_error_slope=0.7,
+        # Relación empírica:
+        # pmdec_error ≈ 0.7 * pmra_error
+        pm_error_slope=0.7,
 
-    #     # Correlación entre las perturbaciones de pmra y pmdec
-    #     pmra_pmdec_corr=0.2,
+        # Correlación entre las perturbaciones de pmra y pmdec
+        pmra_pmdec_corr=0.2,
 
-    #     # Dispersión opcional alrededor de la pendiente 0.7
-    #     pm_error_slope_logscatter=0.08,
+        # Dispersión opcional alrededor de la pendiente 0.7
+        pm_error_slope_logscatter=0.08,
 
-    #     position_error_mas=0.1,
+        position_error_mas=0.1,
 
-    #     seed=42,
-    #     include_true_values=True,
-    # )
+        seed=42,
+        include_true_values=True,
+    )
 
-    # simulator = OpenClusterSimulator(config)
-    # catalog = simulator.simulate()
+    simulator = OpenClusterSimulator(config)
+    catalog = simulator.simulate()
 
-    # print(catalog.head())
+    print(catalog.head())
 
-    # catalog.to_csv(
-    #     "mock_open_cluster_gaia.csv",
-    #     index=False,
-    # )
+    catalog.to_csv(
+        "mock_open_cluster_gaia.csv",
+        index=False,
+    )
