@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from typing import Optional
 
 from astropy import units as u
 from astropy.coordinates import SkyCoord
@@ -3289,3 +3290,360 @@ def correct_gaia_proper_motions(
     result["pm_corr_valid"] = valid
 
     return result
+
+def _normalize_vector(vector: np.ndarray) -> np.ndarray:
+    vector = np.asarray(vector, dtype=float)
+    norm = np.linalg.norm(vector)
+
+    if not np.isfinite(norm) or norm == 0.0:
+        raise ValueError("Input vector has zero or invalid norm.")
+
+    return vector / norm
+
+
+def radec_to_unit_vector(
+    ra_deg: float,
+    dec_deg: float,
+) -> np.ndarray:
+    """
+    Convierte RA, Dec en grados a vector unitario cartesiano ICRS.
+    """
+    ra_rad = np.deg2rad(ra_deg)
+    dec_rad = np.deg2rad(dec_deg)
+
+    return np.array(
+        [
+            np.cos(dec_rad) * np.cos(ra_rad),
+            np.cos(dec_rad) * np.sin(ra_rad),
+            np.sin(dec_rad),
+        ],
+        dtype=float,
+    )
+
+
+def unit_vector_to_radec(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convierte uno o varios vectores unitarios a RA, Dec en grados.
+    """
+    vectors = np.asarray(vectors, dtype=float)
+
+    if vectors.ndim == 1:
+        vectors = vectors.reshape(1, 3)
+
+    norms = np.linalg.norm(vectors, axis=1)
+    valid = np.isfinite(vectors).all(axis=1) & (norms > 0)
+
+    ra_deg = np.full(len(vectors), np.nan)
+    dec_deg = np.full(len(vectors), np.nan)
+
+    v = vectors[valid] / norms[valid, None]
+
+    x = v[:, 0]
+    y = v[:, 1]
+    z = v[:, 2]
+
+    ra_rad = np.arctan2(y, x) % (2.0 * np.pi)
+    dec_rad = np.arcsin(np.clip(z, -1.0, 1.0))
+
+    ra_deg[valid] = np.rad2deg(ra_rad)
+    dec_deg[valid] = np.rad2deg(dec_rad)
+
+    return ra_deg, dec_deg
+
+
+def build_apex_equator_radec(
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+    n_points: int = 1000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Construye el ecuador asociado al ápex.
+
+    Este ecuador es el círculo máximo perpendicular al vector del ápex.
+    No es el ecuador celeste físico, sino el círculo donde deberían caer
+    los polos ideales de estrellas que se mueven hacia ese ápex.
+    """
+    apex_vector = radec_to_unit_vector(apex_ra_deg, apex_dec_deg)
+    apex_vector = _normalize_vector(apex_vector)
+
+    # Vector auxiliar que no sea casi paralelo al ápex
+    aux = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(aux, apex_vector)) > 0.9:
+        aux = np.array([0.0, 1.0, 0.0])
+
+    e1 = _normalize_vector(np.cross(apex_vector, aux))
+    e2 = _normalize_vector(np.cross(apex_vector, e1))
+
+    theta = np.linspace(0.0, 2.0 * np.pi, n_points)
+
+    circle_xyz = (
+        np.cos(theta)[:, None] * e1[None, :]
+        + np.sin(theta)[:, None] * e2[None, :]
+    )
+
+    equator_ra_deg, equator_dec_deg = unit_vector_to_radec(circle_xyz)
+
+    return equator_ra_deg, equator_dec_deg
+
+
+def plot_radec_curve_no_wrap(
+    ax,
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+    *,
+    label: Optional[str] = None,
+    **plot_kwargs,
+):
+    """
+    Grafica una curva RA-Dec evitando líneas artificiales cuando la curva
+    cruza RA = 0/360 deg.
+    """
+    ra_deg = np.asarray(ra_deg, dtype=float)
+    dec_deg = np.asarray(dec_deg, dtype=float)
+
+    valid = np.isfinite(ra_deg) & np.isfinite(dec_deg)
+    ra_deg = ra_deg[valid]
+    dec_deg = dec_deg[valid]
+
+    if len(ra_deg) < 2:
+        return
+
+    jumps = np.where(np.abs(np.diff(ra_deg)) > 180.0)[0] + 1
+
+    ra_segments = np.split(ra_deg, jumps)
+    dec_segments = np.split(dec_deg, jumps)
+
+    for i, (ra_seg, dec_seg) in enumerate(zip(ra_segments, dec_segments)):
+        if len(ra_seg) < 2:
+            continue
+
+        segment_label = label if i == 0 else "_nolegend_"
+
+        ax.plot(
+            ra_seg,
+            dec_seg,
+            label=segment_label,
+            **plot_kwargs,
+        )
+
+
+def add_apex_equator_to_axes(
+    ax,
+    *,
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+    show_apex: bool = True,
+    show_antapex: bool = False,
+    n_points: int = 1000,
+    equator_color: str = "white",
+    equator_lw: float = 2.2,
+    equator_ls: str = "--",
+    equator_alpha: float = 0.95,
+    apex_color: str = "crimson",
+    antapex_color: str = "purple",
+):
+    """
+    Agrega a un eje RA-Dec:
+        - el ecuador del ápex,
+        - opcionalmente el ápex,
+        - opcionalmente el antápex.
+    """
+    equator_ra, equator_dec = build_apex_equator_radec(
+        apex_ra_deg=apex_ra_deg,
+        apex_dec_deg=apex_dec_deg,
+        n_points=n_points,
+    )
+
+    plot_radec_curve_no_wrap(
+        ax,
+        equator_ra,
+        equator_dec,
+        label="Apex equator",
+        color=equator_color,
+        linewidth=equator_lw,
+        linestyle=equator_ls,
+        alpha=equator_alpha,
+    )
+
+    if show_apex:
+        ax.scatter(
+            [apex_ra_deg],
+            [apex_dec_deg],
+            s=170,
+            marker="*",
+            color=apex_color,
+            edgecolor="black",
+            linewidth=0.8,
+            label="Apex",
+            zorder=10,
+        )
+
+    if show_antapex:
+        antapex_ra_deg = (apex_ra_deg + 180.0) % 360.0
+        antapex_dec_deg = -apex_dec_deg
+
+        ax.scatter(
+            [antapex_ra_deg],
+            [antapex_dec_deg],
+            s=120,
+            marker="X",
+            color=antapex_color,
+            edgecolor="black",
+            linewidth=0.8,
+            label="Antapex",
+            zorder=10,
+        )
+
+def plot_apex_error_grid(
+    grid_summary: pd.DataFrame,
+    value_col: str = "metric_mean",
+    title: str = "Apex residual RMS across sky positions",
+    cmap: str = "viridis",
+    figsize: tuple[float, float] = (13, 5),
+    apex_ra_deg: Optional[float] = None,
+    apex_dec_deg: Optional[float] = None,
+    show_apex_equator: bool = True,
+    show_apex: bool = True,
+    show_antapex: bool = False,
+):
+    """
+    Grafica una malla RA-Dec de la métrica de error.
+
+    El eje X es RA y el eje Y es Dec.
+
+    Si se pasan apex_ra_deg y apex_dec_deg, también se grafica el ecuador
+    correspondiente al ápex.
+    """
+
+    pivot = grid_summary.pivot(
+        index="center_dec_deg",
+        columns="center_ra_deg",
+        values=value_col,
+    )
+
+    ra_values = pivot.columns.to_numpy(dtype=float)
+    dec_values = pivot.index.to_numpy(dtype=float)
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    im = ax.imshow(
+        pivot.values,
+        origin="lower",
+        aspect="auto",
+        extent=[
+            ra_values.min(),
+            ra_values.max(),
+            dec_values.min(),
+            dec_values.max(),
+        ],
+        cmap=cmap,
+    )
+
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label(value_col)
+
+    if (
+        show_apex_equator
+        and apex_ra_deg is not None
+        and apex_dec_deg is not None
+    ):
+        add_apex_equator_to_axes(
+            ax,
+            apex_ra_deg=apex_ra_deg,
+            apex_dec_deg=apex_dec_deg,
+            show_apex=show_apex,
+            show_antapex=show_antapex,
+            equator_color="white",
+            equator_lw=2.4,
+            equator_ls="--",
+            equator_alpha=0.95,
+        )
+
+    ax.set_xlabel("Cluster centre RA [deg]")
+    ax.set_ylabel("Cluster centre Dec [deg]")
+    ax.set_title(title)
+
+    ax.set_xlim(ra_values.min(), ra_values.max())
+    ax.set_ylim(dec_values.min(), dec_values.max())
+
+    ax.set_xticks(np.arange(0, 361, 30))
+    ax.set_yticks(np.arange(dec_values.min(), dec_values.max() + 1, 20))
+
+    if apex_ra_deg is not None and apex_dec_deg is not None:
+        ax.legend(loc="upper right")
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax
+
+def plot_apex_error_scatter(
+    grid_summary: pd.DataFrame,
+    value_col: str = "metric_mean",
+    title: str = "Apex residual RMS across sky positions",
+    cmap: str = "viridis",
+    figsize: tuple[float, float] = (12, 5),
+    apex_ra_deg: Optional[float] = None,
+    apex_dec_deg: Optional[float] = None,
+    show_apex_equator: bool = True,
+    show_apex: bool = True,
+    show_antapex: bool = False,
+):
+    """
+    Alternativa en scatter, útil si hay posiciones fallidas o mallas irregulares.
+
+    Si se pasan apex_ra_deg y apex_dec_deg, también se grafica el ecuador
+    correspondiente al ápex.
+    """
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    sc = ax.scatter(
+        grid_summary["center_ra_deg"],
+        grid_summary["center_dec_deg"],
+        c=grid_summary[value_col],
+        s=80,
+        cmap=cmap,
+        edgecolor="k",
+        linewidth=0.2,
+    )
+
+    cbar = plt.colorbar(sc, ax=ax)
+    cbar.set_label(value_col)
+
+    if (
+        show_apex_equator
+        and apex_ra_deg is not None
+        and apex_dec_deg is not None
+    ):
+        add_apex_equator_to_axes(
+            ax,
+            apex_ra_deg=apex_ra_deg,
+            apex_dec_deg=apex_dec_deg,
+            show_apex=show_apex,
+            show_antapex=show_antapex,
+            equator_color="black",
+            equator_lw=2.2,
+            equator_ls="--",
+            equator_alpha=0.9,
+        )
+
+    ax.set_xlabel("Cluster centre RA [deg]")
+    ax.set_ylabel("Cluster centre Dec [deg]")
+    ax.set_title(title)
+
+    ax.set_xlim(0, 360)
+    ax.set_ylim(
+        grid_summary["center_dec_deg"].min() - 5,
+        grid_summary["center_dec_deg"].max() + 5,
+    )
+
+    ax.set_xticks(np.arange(0, 361, 30))
+
+    if apex_ra_deg is not None and apex_dec_deg is not None:
+        ax.legend(loc="upper right")
+
+    plt.tight_layout()
+    plt.show()
+
+    return fig, ax

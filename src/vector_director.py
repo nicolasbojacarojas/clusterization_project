@@ -173,6 +173,261 @@ def unit_vector_to_equatorial_radec(vector: np.ndarray) -> Dict[str, float]:
         "dec_rad": float(dec_rad),
     }
 
+# ============================================================
+# Apex error metrics against a known/injected apex
+# ============================================================
+
+def resolve_apex_vector(
+    apex_vector: Optional[np.ndarray] = None,
+    apex_ra_deg: Optional[float] = None,
+    apex_dec_deg: Optional[float] = None,
+) -> Optional[np.ndarray]:
+    """
+    Construye/resuelve un vector unitario de ápex.
+
+    Se puede pasar:
+        - apex_vector=[x, y, z]
+        - apex_ra_deg y apex_dec_deg
+
+    Si no se pasa nada, devuelve None.
+    """
+
+    if apex_vector is not None:
+        vector = np.asarray(apex_vector, dtype=float)
+    elif apex_ra_deg is not None and apex_dec_deg is not None:
+        vector = equatorial_radec_to_unit_vector(
+            ra_deg=float(apex_ra_deg),
+            dec_deg=float(apex_dec_deg),
+        )
+    else:
+        return None
+
+    norm = np.linalg.norm(vector)
+
+    if not np.isfinite(norm) or norm == 0.0:
+        raise ValueError("The reference apex vector has zero or invalid norm.")
+
+    return vector / norm
+
+
+def angular_distance_between_vectors_deg(
+    vector_1: np.ndarray,
+    vector_2: np.ndarray,
+) -> float:
+    """
+    Distancia angular orientada entre dos vectores unitarios.
+
+    Devuelve un ángulo en [0, 180] grados.
+    Aquí ápex y antápex NO se consideran equivalentes.
+    """
+
+    v1 = np.asarray(vector_1, dtype=float)
+    v2 = np.asarray(vector_2, dtype=float)
+
+    norm_1 = np.linalg.norm(v1)
+    norm_2 = np.linalg.norm(v2)
+
+    if (
+        not np.isfinite(norm_1)
+        or not np.isfinite(norm_2)
+        or norm_1 == 0.0
+        or norm_2 == 0.0
+    ):
+        return np.nan
+
+    v1 = v1 / norm_1
+    v2 = v2 / norm_2
+
+    cos_angle = np.clip(np.dot(v1, v2), -1.0, 1.0)
+
+    return float(np.degrees(np.arccos(cos_angle)))
+
+
+def angular_axis_error_between_vectors_deg(
+    vector_1: np.ndarray,
+    vector_2: np.ndarray,
+) -> float:
+    """
+    Error angular de eje entre dos vectores.
+
+    Devuelve min(theta, 180 - theta), es decir, un ángulo en [0, 90] grados.
+
+    Esta métrica es útil porque el ajuste del plano de polos tiene una
+    degeneración natural ápex/antápex. Si quieres evaluar estrictamente si
+    recuperaste el ápex y no el antápex, usa la métrica orientada.
+    """
+
+    theta = angular_distance_between_vectors_deg(vector_1, vector_2)
+
+    if not np.isfinite(theta):
+        return np.nan
+
+    return float(min(theta, 180.0 - theta))
+
+def apex_bootstrap_stability_metrics(
+    df: pd.DataFrame,
+    reference_apex_vector: np.ndarray,
+    n_bootstrap: int = 200,
+    sample_fraction: float = 0.8,
+    random_state: int = 42,
+    weight_col: Optional[str] = None,
+    min_sources: int = 3,
+    orient_with_motion: bool = True,
+) -> Dict[str, Any]:
+    """
+    Mide la estabilidad angular del ápex mediante bootstrap.
+
+    Esta métrica NO evalúa el residuo de los polos respecto al ápex.
+    Evalúa qué tanto cambia el ápex estimado cuando se cambia la muestra
+    de estrellas del cúmulo.
+
+    Métrica principal:
+        apex_bootstrap_rms_axis_deg
+
+    Interpretación:
+        valor pequeño  -> ápex estable
+        valor grande   -> ápex sensible a la membresía / outliers / ruido
+    """
+
+    if df is None or len(df) < min_sources:
+        return {
+            "apex_bootstrap_rms_axis_deg": np.nan,
+            "apex_bootstrap_median_axis_deg": np.nan,
+            "apex_bootstrap_p16_axis_deg": np.nan,
+            "apex_bootstrap_p84_axis_deg": np.nan,
+            "apex_bootstrap_p95_axis_deg": np.nan,
+            "apex_bootstrap_n_success": 0,
+            "apex_bootstrap_n_failed": int(n_bootstrap),
+        }
+
+    reference_apex_vector = np.asarray(reference_apex_vector, dtype=float)
+    reference_norm = np.linalg.norm(reference_apex_vector)
+
+    if not np.isfinite(reference_norm) or reference_norm == 0.0:
+        return {
+            "apex_bootstrap_rms_axis_deg": np.nan,
+            "apex_bootstrap_median_axis_deg": np.nan,
+            "apex_bootstrap_p16_axis_deg": np.nan,
+            "apex_bootstrap_p84_axis_deg": np.nan,
+            "apex_bootstrap_p95_axis_deg": np.nan,
+            "apex_bootstrap_n_success": 0,
+            "apex_bootstrap_n_failed": int(n_bootstrap),
+        }
+
+    reference_apex_vector = reference_apex_vector / reference_norm
+
+    rng = np.random.default_rng(random_state)
+
+    n_rows = len(df)
+    sample_size = max(min_sources, int(np.ceil(sample_fraction * n_rows)))
+
+    axis_errors_deg = []
+    n_failed = 0
+
+    for _ in range(n_bootstrap):
+        sample_index = rng.choice(
+            np.arange(n_rows),
+            size=sample_size,
+            replace=True,
+        )
+
+        df_boot = df.iloc[sample_index].copy()
+
+        try:
+            boot_result = estimate_apex_and_antapex(
+                df_boot,
+                weight_col=weight_col,
+                orient_with_motion=orient_with_motion,
+                min_sources=min_sources,
+            )
+
+            boot_apex_vector = boot_result["apex_vector"]
+
+            axis_error_deg = angular_axis_error_between_vectors_deg(
+                boot_apex_vector,
+                reference_apex_vector,
+            )
+
+            if np.isfinite(axis_error_deg):
+                axis_errors_deg.append(axis_error_deg)
+            else:
+                n_failed += 1
+
+        except Exception:
+            n_failed += 1
+
+    axis_errors_deg = np.asarray(axis_errors_deg, dtype=float)
+
+    if len(axis_errors_deg) == 0:
+        return {
+            "apex_bootstrap_rms_axis_deg": np.nan,
+            "apex_bootstrap_median_axis_deg": np.nan,
+            "apex_bootstrap_p16_axis_deg": np.nan,
+            "apex_bootstrap_p84_axis_deg": np.nan,
+            "apex_bootstrap_p95_axis_deg": np.nan,
+            "apex_bootstrap_n_success": 0,
+            "apex_bootstrap_n_failed": int(n_failed),
+        }
+
+    return {
+        "apex_bootstrap_rms_axis_deg": float(
+            np.sqrt(np.mean(axis_errors_deg**2))
+        ),
+        "apex_bootstrap_median_axis_deg": float(
+            np.median(axis_errors_deg)
+        ),
+        "apex_bootstrap_p16_axis_deg": float(
+            np.percentile(axis_errors_deg, 16)
+        ),
+        "apex_bootstrap_p84_axis_deg": float(
+            np.percentile(axis_errors_deg, 84)
+        ),
+        "apex_bootstrap_p95_axis_deg": float(
+            np.percentile(axis_errors_deg, 95)
+        ),
+        "apex_bootstrap_n_success": int(len(axis_errors_deg)),
+        "apex_bootstrap_n_failed": int(n_failed),
+    }
+
+def add_true_apex_error_to_apex_result(
+    apex_result: Optional[Dict[str, Any]],
+    true_apex_vector: Optional[np.ndarray],
+    prefix: str,
+) -> Dict[str, float]:
+    """
+    Calcula errores entre un resultado de ápex y el ápex verdadero.
+
+    Devuelve dos métricas:
+        - {prefix}_oriented_error_true_deg:
+            error angular directo, en [0, 180].
+        - {prefix}_axis_error_true_deg:
+            error de eje, en [0, 90], con degeneración ápex/antápex.
+    """
+
+    if apex_result is None or true_apex_vector is None:
+        return {
+            f"{prefix}_oriented_error_true_deg": np.nan,
+            f"{prefix}_axis_error_true_deg": np.nan,
+        }
+
+    estimated_vector = apex_result.get("apex_vector")
+
+    if estimated_vector is None:
+        return {
+            f"{prefix}_oriented_error_true_deg": np.nan,
+            f"{prefix}_axis_error_true_deg": np.nan,
+        }
+
+    return {
+        f"{prefix}_oriented_error_true_deg": angular_distance_between_vectors_deg(
+            estimated_vector,
+            true_apex_vector,
+        ),
+        f"{prefix}_axis_error_true_deg": angular_axis_error_between_vectors_deg(
+            estimated_vector,
+            true_apex_vector,
+        ),
+    }
 
 def add_initial_final_equatorial_vectors(
     df: pd.DataFrame,
@@ -809,6 +1064,9 @@ def process_single_cluster(
     refine_apex: bool = True,
     min_sin_lambda: float = 0.15,
     min_pole_norm: float = 0.0,
+    true_apex_vector: Optional[np.ndarray] = None,
+    true_apex_ra_deg: Optional[float] = None,
+    true_apex_dec_deg: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Procesa un único cúmulo y estima su ápex inicial y refinado.
@@ -820,6 +1078,11 @@ def process_single_cluster(
     Esto evita fuentes con movimiento tangencial muy pequeño, donde el polo
     del círculo máximo queda peor condicionado.
     """
+    true_apex_vector_resolved = resolve_apex_vector(
+        apex_vector=true_apex_vector,
+        apex_ra_deg=true_apex_ra_deg,
+        apex_dec_deg=true_apex_dec_deg,
+    )
 
     validate_columns(df, [cluster_col, ra_col, dec_col, pmra_col, pmdec_col])
 
@@ -901,6 +1164,17 @@ def process_single_cluster(
         )
         cross_initial = None
 
+    apex_initial_bootstrap_metrics = apex_bootstrap_stability_metrics(
+        df=df_initial,
+        reference_apex_vector=apex_initial["apex_vector"],
+        n_bootstrap=200,
+        sample_fraction=0.8,
+        random_state=42,
+        weight_col=effective_weight_col,
+        min_sources=min_stars,
+        orient_with_motion=True,
+    )
+
     df_refined = df_initial.copy()
     apex_refined = apex_initial
     cross_refined = cross_initial
@@ -973,6 +1247,47 @@ def process_single_cluster(
                 "stars after refinement cut. Using initial apex."
             )
 
+    true_apex_coordinates = (
+        unit_vector_to_equatorial_radec(true_apex_vector_resolved)
+        if true_apex_vector_resolved is not None
+        else None
+    )
+
+    apex_refined_bootstrap_metrics = apex_bootstrap_stability_metrics(
+        df=df_refined,
+        reference_apex_vector=apex_refined["apex_vector"],
+        n_bootstrap=200,
+        sample_fraction=0.8,
+        random_state=43,
+        weight_col=effective_weight_col,
+        min_sources=min_stars,
+        orient_with_motion=True,
+    )
+
+    apex_initial_true_errors = add_true_apex_error_to_apex_result(
+        apex_initial,
+        true_apex_vector_resolved,
+        prefix="apex_initial",
+    )
+
+    apex_refined_true_errors = add_true_apex_error_to_apex_result(
+        apex_refined,
+        true_apex_vector_resolved,
+        prefix="apex_refined",
+    )
+
+    cross_initial_true_errors = add_true_apex_error_to_apex_result(
+        cross_initial,
+        true_apex_vector_resolved,
+        prefix="cross_initial",
+    )
+
+    cross_refined_true_errors = add_true_apex_error_to_apex_result(
+        cross_refined,
+        true_apex_vector_resolved,
+        prefix="cross_refined",
+    )
+
     return {
         "cluster_id": cluster_id,
         "n_stars": int(len(df_cluster)),
@@ -985,6 +1300,26 @@ def process_single_cluster(
 
         "cross_initial": cross_initial,
         "cross_refined": cross_refined,
+
+        "apex_initial_bootstrap_metrics": apex_initial_bootstrap_metrics,
+        "apex_refined_bootstrap_metrics": apex_refined_bootstrap_metrics,
+
+        "true_apex_vector": true_apex_vector_resolved,
+        "true_apex_ra_deg": (
+            true_apex_coordinates["ra_deg"]
+            if true_apex_coordinates is not None
+            else np.nan
+        ),
+        "true_apex_dec_deg": (
+            true_apex_coordinates["dec_deg"]
+            if true_apex_coordinates is not None
+            else np.nan
+        ),
+
+        **apex_initial_true_errors,
+        **apex_refined_true_errors,
+        **cross_initial_true_errors,
+        **cross_refined_true_errors,
 
         "data_initial": df_initial,
         "data_refined": df_refined,
@@ -1003,6 +1338,9 @@ def process_all_clusters(
     refine_apex: bool = True,
     min_sin_lambda: float = 0.15,
     min_pole_norm: float = 0.0,
+    true_apex_vector: Optional[np.ndarray] = None,
+    true_apex_ra_deg: Optional[float] = None,
+    true_apex_dec_deg: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
     Procesa todos los cluster_id presentes en el DataFrame.
@@ -1028,6 +1366,9 @@ def process_all_clusters(
             refine_apex=refine_apex,
             min_sin_lambda=min_sin_lambda,
             min_pole_norm=min_pole_norm,
+            true_apex_vector=true_apex_vector,
+            true_apex_ra_deg=true_apex_ra_deg,
+            true_apex_dec_deg=true_apex_dec_deg,
         )
 
         if cluster_result is not None:
@@ -1059,11 +1400,16 @@ def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
     cross_initial = result.get("cross_initial")
     cross_refined = result.get("cross_refined")
 
+    apex_initial_bootstrap = result.get("apex_initial_bootstrap_metrics", {})
+    apex_refined_bootstrap = result.get("apex_refined_bootstrap_metrics", {})
+
     return {
         "cluster_id": result["cluster_id"],
         "n_stars": result["n_stars"],
         "n_stars_initial": result["n_stars_initial"],
         "n_stars_refined": result["n_stars_refined"],
+        "true_apex_ra_deg": result.get("true_apex_ra_deg", np.nan),
+        "true_apex_dec_deg": result.get("true_apex_dec_deg", np.nan),
 
         "apex_initial_ra_deg": apex_initial["apex_ra_deg"],
         "apex_initial_dec_deg": apex_initial["apex_dec_deg"],
@@ -1078,6 +1424,38 @@ def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "toward_apex_fraction_initial": apex_initial[
             "toward_apex_fraction"
         ],
+        "apex_initial_bootstrap_rms_axis_deg": apex_initial_bootstrap.get(
+            "apex_bootstrap_rms_axis_deg",
+            np.nan,
+        ),
+        "apex_initial_bootstrap_median_axis_deg": apex_initial_bootstrap.get(
+            "apex_bootstrap_median_axis_deg",
+            np.nan,
+        ),
+        "apex_initial_bootstrap_p16_axis_deg": apex_initial_bootstrap.get(
+            "apex_bootstrap_p16_axis_deg",
+            np.nan,
+        ),
+        "apex_initial_bootstrap_p84_axis_deg": apex_initial_bootstrap.get(
+            "apex_bootstrap_p84_axis_deg",
+            np.nan,
+        ),
+        "apex_initial_bootstrap_p95_axis_deg": apex_initial_bootstrap.get(
+            "apex_bootstrap_p95_axis_deg",
+            np.nan,
+        ),
+        "apex_initial_bootstrap_n_success": apex_initial_bootstrap.get(
+            "apex_bootstrap_n_success",
+            0,
+        ),
+        "apex_initial_oriented_error_true_deg": result.get(
+            "apex_initial_oriented_error_true_deg",
+            np.nan,
+        ),
+        "apex_initial_axis_error_true_deg": result.get(
+            "apex_initial_axis_error_true_deg",
+            np.nan,
+        ),
 
         "apex_refined_ra_deg": apex_refined["apex_ra_deg"],
         "apex_refined_dec_deg": apex_refined["apex_dec_deg"],
@@ -1092,6 +1470,38 @@ def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
         "toward_apex_fraction_refined": apex_refined[
             "toward_apex_fraction"
         ],
+        "apex_refined_bootstrap_rms_axis_deg": apex_refined_bootstrap.get(
+            "apex_bootstrap_rms_axis_deg",
+            np.nan,
+        ),
+        "apex_refined_bootstrap_median_axis_deg": apex_refined_bootstrap.get(
+            "apex_bootstrap_median_axis_deg",
+            np.nan,
+        ),
+        "apex_refined_bootstrap_p16_axis_deg": apex_refined_bootstrap.get(
+            "apex_bootstrap_p16_axis_deg",
+            np.nan,
+        ),
+        "apex_refined_bootstrap_p84_axis_deg": apex_refined_bootstrap.get(
+            "apex_bootstrap_p84_axis_deg",
+            np.nan,
+        ),
+        "apex_refined_bootstrap_p95_axis_deg": apex_refined_bootstrap.get(
+            "apex_bootstrap_p95_axis_deg",
+            np.nan,
+        ),
+        "apex_refined_bootstrap_n_success": apex_refined_bootstrap.get(
+            "apex_bootstrap_n_success",
+            0,
+        ),
+        "apex_refined_oriented_error_true_deg": result.get(
+            "apex_refined_oriented_error_true_deg",
+            np.nan,
+        ),
+        "apex_refined_axis_error_true_deg": result.get(
+            "apex_refined_axis_error_true_deg",
+            np.nan,
+        ),
 
         "cross_initial_apex_ra_deg": _safe_get(cross_initial, "apex_ra_deg"),
         "cross_initial_apex_dec_deg": _safe_get(cross_initial, "apex_dec_deg"),
@@ -1108,6 +1518,22 @@ def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "rms_intersection_residual_deg",
         ),
         "cross_refined_n_pairs_used": _safe_get(cross_refined, "n_pairs_used"),
+        "cross_initial_oriented_error_true_deg": result.get(
+            "cross_initial_oriented_error_true_deg",
+            np.nan,
+        ),
+        "cross_initial_axis_error_true_deg": result.get(
+            "cross_initial_axis_error_true_deg",
+            np.nan,
+        ),
+        "cross_refined_oriented_error_true_deg": result.get(
+            "cross_refined_oriented_error_true_deg",
+            np.nan,
+        ),
+        "cross_refined_axis_error_true_deg": result.get(
+            "cross_refined_axis_error_true_deg",
+            np.nan,
+        ),
     }
 
 
@@ -1141,6 +1567,9 @@ def run_cluster_analysis_from_dataframe(
     refine_apex: bool = True,
     min_sin_lambda: float = 0.15,
     min_pole_norm: float = 0.0,
+    true_apex_vector: Optional[np.ndarray] = None,
+    true_apex_ra_deg: Optional[float] = None,
+    true_apex_dec_deg: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Ejecuta el análisis completo desde un DataFrame de pandas ya cargado.
@@ -1197,6 +1626,9 @@ def run_cluster_analysis_from_dataframe(
             refine_apex=refine_apex,
             min_sin_lambda=min_sin_lambda,
             min_pole_norm=min_pole_norm,
+            true_apex_vector=true_apex_vector,
+            true_apex_ra_deg=true_apex_ra_deg,
+            true_apex_dec_deg=true_apex_dec_deg,
         )
 
         summary = (
@@ -1223,6 +1655,9 @@ def run_cluster_analysis_from_dataframe(
         refine_apex=refine_apex,
         min_sin_lambda=min_sin_lambda,
         min_pole_norm=min_pole_norm,
+        true_apex_vector=true_apex_vector,
+        true_apex_ra_deg=true_apex_ra_deg,
+        true_apex_dec_deg=true_apex_dec_deg,
     )
 
     summary_df = summarize_all_cluster_results(cluster_results)
@@ -1258,6 +1693,9 @@ def run_cluster_analysis(
     refine_apex: bool = True,
     min_sin_lambda: float = 0.15,
     min_pole_norm: float = 0.0,
+    true_apex_vector: Optional[np.ndarray] = None,
+    true_apex_ra_deg: Optional[float] = None,
+    true_apex_dec_deg: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Ejecuta el análisis completo desde un archivo CSV.
@@ -1286,6 +1724,9 @@ def run_cluster_analysis(
         refine_apex=refine_apex,
         min_sin_lambda=min_sin_lambda,
         min_pole_norm=min_pole_norm,
+        true_apex_vector=true_apex_vector,
+        true_apex_ra_deg=true_apex_ra_deg,
+        true_apex_dec_deg=true_apex_dec_deg,
     )
 
 
