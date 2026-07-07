@@ -3350,6 +3350,43 @@ def unit_vector_to_radec(vectors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
     return ra_deg, dec_deg
 
+def build_apex_parallel_radec(
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+    angular_distance_deg: float,
+    n_points: int = 1000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Construye un paralelo del sistema asociado al ápex.
+
+    El paralelo es el conjunto de puntos separados del ápex por una
+    distancia angular constante.
+
+    angular_distance_deg:
+        0 deg   -> ápex
+        90 deg  -> ecuador del ápex
+        180 deg -> antápex
+    """
+    apex_vector, e1, e2 = build_apex_reference_frame(
+        apex_ra_deg=apex_ra_deg,
+        apex_dec_deg=apex_dec_deg,
+    )
+
+    theta = np.deg2rad(angular_distance_deg)
+    phi = np.linspace(0.0, 2.0 * np.pi, n_points)
+
+    circle_xyz = (
+        np.cos(theta) * apex_vector[None, :]
+        + np.sin(theta)
+        * (
+            np.cos(phi)[:, None] * e1[None, :]
+            + np.sin(phi)[:, None] * e2[None, :]
+        )
+    )
+
+    parallel_ra_deg, parallel_dec_deg = unit_vector_to_radec(circle_xyz)
+
+    return parallel_ra_deg, parallel_dec_deg
 
 def build_apex_equator_radec(
     apex_ra_deg: float,
@@ -3426,6 +3463,94 @@ def plot_radec_curve_no_wrap(
             **plot_kwargs,
         )
 
+def build_apex_reference_frame(
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Construye una base ortonormal asociada al ápex.
+
+    apex_vector: eje polar del sistema.
+    e1, e2: base ortonormal en el plano perpendicular al ápex.
+    """
+    apex_vector = radec_to_unit_vector(apex_ra_deg, apex_dec_deg)
+    apex_vector = _normalize_vector(apex_vector)
+
+    aux = np.array([1.0, 0.0, 0.0])
+    if abs(np.dot(aux, apex_vector)) > 0.9:
+        aux = np.array([0.0, 1.0, 0.0])
+
+    e1 = _normalize_vector(np.cross(apex_vector, aux))
+    e2 = _normalize_vector(np.cross(apex_vector, e1))
+
+    return apex_vector, e1, e2
+
+
+def build_apex_equator_radec(
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+    n_points: int = 1000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Construye el ecuador asociado al ápex.
+
+    Este ecuador es el círculo máximo perpendicular al vector del ápex.
+    """
+    apex_vector, e1, e2 = build_apex_reference_frame(
+        apex_ra_deg=apex_ra_deg,
+        apex_dec_deg=apex_dec_deg,
+    )
+
+    theta = np.linspace(0.0, 2.0 * np.pi, n_points)
+
+    circle_xyz = (
+        np.cos(theta)[:, None] * e1[None, :]
+        + np.sin(theta)[:, None] * e2[None, :]
+    )
+
+    equator_ra_deg, equator_dec_deg = unit_vector_to_radec(circle_xyz)
+
+    return equator_ra_deg, equator_dec_deg
+
+
+def build_apex_meridian_radec(
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+    meridian_phase_deg: float,
+    n_points: int = 1000,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Construye un meridiano del sistema asociado al ápex.
+
+    Cada meridiano es un círculo máximo que pasa por:
+        - ápex,
+        - antápex,
+        - dos puntos del ecuador del ápex.
+    """
+    apex_vector, e1, e2 = build_apex_reference_frame(
+        apex_ra_deg=apex_ra_deg,
+        apex_dec_deg=apex_dec_deg,
+    )
+
+    phi = np.deg2rad(meridian_phase_deg)
+
+    equator_direction = (
+        np.cos(phi) * e1
+        + np.sin(phi) * e2
+    )
+    equator_direction = _normalize_vector(equator_direction)
+
+    theta = np.linspace(0.0, 2.0 * np.pi, n_points)
+
+    meridian_xyz = (
+        np.cos(theta)[:, None] * apex_vector[None, :]
+        + np.sin(theta)[:, None] * equator_direction[None, :]
+    )
+
+    meridian_ra_deg, meridian_dec_deg = unit_vector_to_radec(meridian_xyz)
+
+    return meridian_ra_deg, meridian_dec_deg
+
 
 def add_apex_equator_to_axes(
     ax,
@@ -3434,20 +3559,43 @@ def add_apex_equator_to_axes(
     apex_dec_deg: float,
     show_apex: bool = True,
     show_antapex: bool = False,
+
+    show_meridians: bool = True,
+    n_meridians: int = 4,
+    meridian_phases_deg: Optional[list[float]] = None,
+
+    show_parallels: bool = True,
+    parallel_distances_deg: Optional[list[float]] = None,
+
     n_points: int = 1000,
+
     equator_color: str = "white",
     equator_lw: float = 2.2,
     equator_ls: str = "--",
     equator_alpha: float = 0.95,
+
+    meridian_color: str = "white",
+    meridian_lw: float = 1.3,
+    meridian_ls: str = ":",
+    meridian_alpha: float = 0.65,
+
+    parallel_color: str = "white",
+    parallel_lw: float = 1.1,
+    parallel_ls: str = "-.",
+    parallel_alpha: float = 0.50,
+
     apex_color: str = "crimson",
     antapex_color: str = "purple",
 ):
     """
-    Agrega a un eje RA-Dec:
-        - el ecuador del ápex,
-        - opcionalmente el ápex,
-        - opcionalmente el antápex.
+    Agrega una grilla angular asociada al ápex:
+        - ecuador del ápex,
+        - meridianos,
+        - paralelos,
+        - ápex y antápex opcionales.
     """
+
+    # Ecuador del ápex
     equator_ra, equator_dec = build_apex_equator_radec(
         apex_ra_deg=apex_ra_deg,
         apex_dec_deg=apex_dec_deg,
@@ -3463,7 +3611,70 @@ def add_apex_equator_to_axes(
         linewidth=equator_lw,
         linestyle=equator_ls,
         alpha=equator_alpha,
+        zorder=8,
     )
+
+    # Meridianos: círculos máximos que pasan por ápex y antápex
+    if show_meridians:
+        if meridian_phases_deg is None:
+            meridian_phases_deg = np.linspace(
+                0.0,
+                180.0,
+                n_meridians,
+                endpoint=False,
+            )
+
+        for i, phase_deg in enumerate(meridian_phases_deg):
+            meridian_ra, meridian_dec = build_apex_meridian_radec(
+                apex_ra_deg=apex_ra_deg,
+                apex_dec_deg=apex_dec_deg,
+                meridian_phase_deg=phase_deg,
+                n_points=n_points,
+            )
+
+            plot_radec_curve_no_wrap(
+                ax,
+                meridian_ra,
+                meridian_dec,
+                label="Apex meridians" if i == 0 else "_nolegend_",
+                color=meridian_color,
+                linewidth=meridian_lw,
+                linestyle=meridian_ls,
+                alpha=meridian_alpha,
+                zorder=7,
+            )
+
+    # Paralelos: círculos de distancia angular constante al ápex
+    if show_parallels:
+        if parallel_distances_deg is None:
+            parallel_distances_deg = [30.0, 60.0, 120.0, 150.0]
+
+        for i, distance_deg in enumerate(parallel_distances_deg):
+            if np.isclose(distance_deg, 0.0) or np.isclose(distance_deg, 180.0):
+                continue
+
+            # Si se incluye 90 deg, sería el ecuador, que ya se dibujó.
+            if np.isclose(distance_deg, 90.0):
+                continue
+
+            parallel_ra, parallel_dec = build_apex_parallel_radec(
+                apex_ra_deg=apex_ra_deg,
+                apex_dec_deg=apex_dec_deg,
+                angular_distance_deg=distance_deg,
+                n_points=n_points,
+            )
+
+            plot_radec_curve_no_wrap(
+                ax,
+                parallel_ra,
+                parallel_dec,
+                label="Apex parallels" if i == 0 else "_nolegend_",
+                color=parallel_color,
+                linewidth=parallel_lw,
+                linestyle=parallel_ls,
+                alpha=parallel_alpha,
+                zorder=6,
+            )
 
     if show_apex:
         ax.scatter(
@@ -3505,6 +3716,10 @@ def plot_apex_error_grid(
     show_apex_equator: bool = True,
     show_apex: bool = True,
     show_antapex: bool = False,
+    show_meridians: bool = True,
+    n_meridians: int = 4,
+    show_parallels: bool = True,
+    parallel_distances_deg: Optional[list[float]] = None,
 ):
     """
     Grafica una malla RA-Dec de la métrica de error.
@@ -3553,10 +3768,27 @@ def plot_apex_error_grid(
             apex_dec_deg=apex_dec_deg,
             show_apex=show_apex,
             show_antapex=show_antapex,
+
+            show_meridians=show_meridians,
+            n_meridians=n_meridians,
+
+            show_parallels=show_parallels,
+            parallel_distances_deg=parallel_distances_deg,
+
             equator_color="white",
             equator_lw=2.4,
             equator_ls="--",
             equator_alpha=0.95,
+
+            meridian_color="white",
+            meridian_lw=1.2,
+            meridian_ls=":",
+            meridian_alpha=0.55,
+
+            parallel_color="white",
+            parallel_lw=1.1,
+            parallel_ls="-.",
+            parallel_alpha=0.45,
         )
 
     ax.set_xlabel("Cluster centre RA [deg]")

@@ -558,6 +558,715 @@ def add_cross_product_poles(
 
     return result
 
+def add_pole_apex_error_comparison(
+    df: pd.DataFrame,
+    apex_vector: np.ndarray,
+    pole_x_col: str = "pole_x_unit",
+    pole_y_col: str = "pole_y_unit",
+    pole_z_col: str = "pole_z_unit",
+    sin_lambda_col: str = "sin_lambda",
+    prefix: str = "refined",
+    min_sin_lambda: float = 1e-6,
+    copy: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrega dos errores para comparar:
+
+    1. Error geométrico:
+        arcsin(polo · apex)
+
+    2. Error direccional corregido:
+        arcsin((polo · apex) / sin(lambda))
+
+    Ambos se guardan con signo y en valor absoluto.
+    """
+
+    validate_columns(df, [pole_x_col, pole_y_col, pole_z_col, sin_lambda_col])
+
+    result = df.copy() if copy else df
+
+    apex_vector = np.asarray(apex_vector, dtype=float)
+    apex_norm = np.linalg.norm(apex_vector)
+
+    if not np.isfinite(apex_norm) or apex_norm == 0.0:
+        raise ValueError("Invalid apex_vector: zero or non-finite norm.")
+
+    apex_unit = apex_vector / apex_norm
+
+    poles = result[[pole_x_col, pole_y_col, pole_z_col]].to_numpy(dtype=float)
+    pole_norms = np.linalg.norm(poles, axis=1)
+
+    valid_poles = (
+        np.isfinite(poles).all(axis=1)
+        & np.isfinite(pole_norms)
+        & (pole_norms > 0.0)
+    )
+
+    poles_unit = np.full_like(poles, np.nan, dtype=float)
+    poles_unit[valid_poles] = poles[valid_poles] / pole_norms[valid_poles, None]
+
+    dot = np.full(len(result), np.nan, dtype=float)
+    dot[valid_poles] = poles_unit[valid_poles] @ apex_unit
+    dot = np.clip(dot, -1.0, 1.0)
+
+    # 1. Error geométrico: arcsin(p · apex)
+    geometric_signed_deg = np.degrees(np.arcsin(dot))
+    geometric_abs_deg = np.degrees(np.arcsin(np.abs(dot)))
+
+    # 2. Error direccional corregido por sin(lambda)
+    sin_lambda = result[sin_lambda_col].to_numpy(dtype=float)
+
+    valid_direction = (
+        np.isfinite(dot)
+        & np.isfinite(sin_lambda)
+        & (sin_lambda > min_sin_lambda)
+    )
+
+    ratio = np.full(len(result), np.nan, dtype=float)
+    ratio[valid_direction] = dot[valid_direction] / sin_lambda[valid_direction]
+    ratio = np.clip(ratio, -1.0, 1.0)
+
+    direction_signed_deg = np.degrees(np.arcsin(ratio))
+    direction_abs_deg = np.degrees(np.arcsin(np.abs(ratio)))
+
+    valid_inverse = (
+        np.isfinite(dot)
+        & np.isfinite(sin_lambda)
+    )
+
+    ratio_inverse = np.full(len(result), np.nan, dtype=float)
+    ratio_inverse[valid_inverse] = dot[valid_inverse] * sin_lambda[valid_inverse]
+    ratio_inverse = np.clip(ratio_inverse, -1.0, 1.0)
+
+    direction_signed_inverse_deg = np.degrees(np.arcsin(ratio_inverse))
+    direction_abs_inverse_deg = np.degrees(np.arcsin(np.abs(ratio_inverse)))
+
+    result[f"pole_apex_dot_{prefix}"] = dot
+    result[f"pole_apex_error_geom_signed_{prefix}_deg"] = geometric_signed_deg
+    result[f"pole_apex_error_geom_abs_{prefix}_deg"] = geometric_abs_deg
+
+    result[f"pole_apex_error_direction_ratio_{prefix}"] = ratio
+    result[f"pole_apex_error_direction_signed_{prefix}_deg"] = direction_signed_deg
+    result[f"pole_apex_error_direction_abs_{prefix}_deg"] = direction_abs_deg
+
+    result[f"pole_apex_error_direction_inverse_ratio_{prefix}"] = ratio_inverse
+    result[f"pole_apex_error_direction_inverse_signed_{prefix}_deg"] = direction_signed_inverse_deg
+    result[f"pole_apex_error_direction_inverse_abs_{prefix}_deg"] = direction_abs_inverse_deg
+
+    return result
+
+def add_perfect_poles_and_theta_from_apex(
+    df: pd.DataFrame,
+    apex_vector: np.ndarray,
+    x_initial_col: str = "x_initial",
+    y_initial_col: str = "y_initial",
+    z_initial_col: str = "z_initial",
+    pole_x_col: str = "pole_x_unit",
+    pole_y_col: str = "pole_y_unit",
+    pole_z_col: str = "pole_z_unit",
+    prefix: str = "apex",
+    copy: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrega al DataFrame el polo perfecto de cada estrella y el ángulo theta
+    entre ese polo perfecto y el polo observado de la estrella.
+
+    Definición:
+
+        perfect_pole_i = r_i x apex
+
+    donde:
+        r_i   = posición inicial unitaria de la estrella
+        apex  = vector unitario del ápex del cúmulo
+
+    Luego calcula:
+
+        theta = angle(perfect_pole_i, observed_pole_i)
+
+    Columnas agregadas:
+        perfect_pole_{prefix}_x
+        perfect_pole_{prefix}_y
+        perfect_pole_{prefix}_z
+        perfect_pole_{prefix}_norm
+
+        perfect_pole_{prefix}_x_unit
+        perfect_pole_{prefix}_y_unit
+        perfect_pole_{prefix}_z_unit
+
+        theta_pole_{prefix}_deg
+        theta_pole_axis_{prefix}_deg
+
+    Nota:
+        theta_pole_{prefix}_deg es el ángulo orientado en [0, 180].
+        theta_pole_axis_{prefix}_deg trata p y -p como equivalentes,
+        por tanto queda en [0, 90].
+    """
+
+    required_columns = [
+        x_initial_col,
+        y_initial_col,
+        z_initial_col,
+        pole_x_col,
+        pole_y_col,
+        pole_z_col,
+    ]
+
+    validate_columns(df, required_columns)
+
+    result = df.copy() if copy else df
+
+    apex_vector = np.asarray(apex_vector, dtype=float)
+    apex_norm = np.linalg.norm(apex_vector)
+
+    if apex_norm == 0.0 or not np.isfinite(apex_norm):
+        raise ValueError("Invalid apex_vector: zero or non-finite norm.")
+
+    apex_unit = apex_vector / apex_norm
+
+    initial_vectors = result[
+        [x_initial_col, y_initial_col, z_initial_col]
+    ].to_numpy(dtype=float)
+
+    initial_norms = np.linalg.norm(initial_vectors, axis=1)
+
+    initial_valid = (
+        np.isfinite(initial_vectors).all(axis=1)
+        & np.isfinite(initial_norms)
+        & (initial_norms > 0.0)
+    )
+
+    initial_unit = np.full_like(initial_vectors, np.nan, dtype=float)
+    initial_unit[initial_valid] = (
+        initial_vectors[initial_valid] / initial_norms[initial_valid, None]
+    )
+
+    # Polo perfecto: posición inicial x ápex del cúmulo
+    perfect_poles = np.cross(initial_unit, apex_unit)
+    perfect_norms = np.linalg.norm(perfect_poles, axis=1)
+
+    perfect_valid = (
+        np.isfinite(perfect_poles).all(axis=1)
+        & np.isfinite(perfect_norms)
+        & (perfect_norms > 0.0)
+    )
+
+    perfect_unit = np.full_like(perfect_poles, np.nan, dtype=float)
+    perfect_unit[perfect_valid] = (
+        perfect_poles[perfect_valid] / perfect_norms[perfect_valid, None]
+    )
+
+    result[f"perfect_pole_{prefix}_x"] = perfect_poles[:, 0]
+    result[f"perfect_pole_{prefix}_y"] = perfect_poles[:, 1]
+    result[f"perfect_pole_{prefix}_z"] = perfect_poles[:, 2]
+    result[f"perfect_pole_{prefix}_norm"] = perfect_norms
+
+    result[f"perfect_pole_{prefix}_x_unit"] = perfect_unit[:, 0]
+    result[f"perfect_pole_{prefix}_y_unit"] = perfect_unit[:, 1]
+    result[f"perfect_pole_{prefix}_z_unit"] = perfect_unit[:, 2]
+
+    observed_poles = result[
+        [pole_x_col, pole_y_col, pole_z_col]
+    ].to_numpy(dtype=float)
+
+    observed_norms = np.linalg.norm(observed_poles, axis=1)
+
+    observed_valid = (
+        np.isfinite(observed_poles).all(axis=1)
+        & np.isfinite(observed_norms)
+        & (observed_norms > 0.0)
+    )
+
+    observed_unit = np.full_like(observed_poles, np.nan, dtype=float)
+    observed_unit[observed_valid] = (
+        observed_poles[observed_valid] / observed_norms[observed_valid, None]
+    )
+
+    valid_theta = perfect_valid & observed_valid
+
+    dot = np.full(len(result), np.nan, dtype=float)
+    dot[valid_theta] = np.sum(
+        perfect_unit[valid_theta] * observed_unit[valid_theta],
+        axis=1,
+    )
+
+    dot = np.clip(dot, -1.0, 1.0)
+
+    theta_deg = np.degrees(np.arccos(dot))
+
+    # Versión axial: útil si el signo del polo puede invertirse.
+    theta_axis_deg = np.degrees(np.arccos(np.abs(dot)))
+
+    result[f"theta_pole_{prefix}_deg"] = theta_deg
+    result[f"theta_pole_axis_{prefix}_deg"] = theta_axis_deg
+
+    return result
+
+def sigma_clip_by_theta_pole(
+    df: pd.DataFrame,
+    theta_col: str = "theta_pole_axis_initial_deg",
+    nsigma: float = 3.0,
+    min_remaining: int = 5,
+    prefix: str = "theta_clip",
+    copy: bool = True,
+):
+    """
+    Aplica sigma clipping sobre la distribución de theta entre el polo observado
+    y el polo perfecto.
+
+    Usa una estimación robusta:
+
+        sigma = 1.4826 * MAD
+
+    y conserva las estrellas con:
+
+        theta <= median(theta) + nsigma * sigma
+
+    Retorna:
+        df_marked : dataframe con columnas de diagnóstico
+        df_inliers : dataframe solo con estrellas aceptadas
+        clip_info : diccionario con resumen del clipping
+    """
+
+    validate_columns(df, [theta_col])
+
+    result = df.copy() if copy else df
+
+    theta = result[theta_col].to_numpy(dtype=float)
+    finite = np.isfinite(theta)
+
+    if finite.sum() == 0:
+        result[f"{prefix}_is_inlier"] = False
+        result[f"{prefix}_is_outlier"] = True
+
+        clip_info = {
+            "theta_clip_column": theta_col,
+            "theta_clip_nsigma": nsigma,
+            "theta_clip_center_deg": np.nan,
+            "theta_clip_sigma_deg": np.nan,
+            "theta_clip_threshold_deg": np.nan,
+            "theta_clip_n_total": int(len(result)),
+            "theta_clip_n_finite": 0,
+            "theta_clip_n_inliers": 0,
+            "theta_clip_n_outliers": int(len(result)),
+            "theta_clip_used": False,
+        }
+
+        return result, result.iloc[0:0].copy(), clip_info
+
+    theta_finite = theta[finite]
+
+    center = float(np.median(theta_finite))
+    mad = float(np.median(np.abs(theta_finite - center)))
+    sigma = 1.4826 * mad
+
+    # Fallback si el MAD da cero.
+    if not np.isfinite(sigma) or sigma == 0.0:
+        sigma = float(np.std(theta_finite))
+
+    # Si incluso std da cero, no hay dispersión medible: se conservan todas.
+    if not np.isfinite(sigma) or sigma == 0.0:
+        threshold = center
+        inlier = finite
+    else:
+        threshold = center + nsigma * sigma
+        inlier = finite & (theta <= threshold)
+
+    outlier = ~inlier
+
+    # Seguridad: si el clipping deja muy pocas estrellas, no se aplica.
+    clipping_used = True
+
+    if inlier.sum() < min_remaining:
+        inlier = finite
+        outlier = ~inlier
+        clipping_used = False
+
+    result[f"{prefix}_is_inlier"] = inlier
+    result[f"{prefix}_is_outlier"] = outlier
+    result[f"{prefix}_theta_center_deg"] = center
+    result[f"{prefix}_theta_sigma_deg"] = sigma
+    result[f"{prefix}_theta_threshold_deg"] = threshold
+    result[f"{prefix}_theta_nsigma"] = nsigma
+
+    df_inliers = result.loc[inlier].copy()
+
+    clip_info = {
+        "theta_clip_column": theta_col,
+        "theta_clip_nsigma": float(nsigma),
+        "theta_clip_center_deg": float(center),
+        "theta_clip_sigma_deg": float(sigma),
+        "theta_clip_threshold_deg": float(threshold),
+        "theta_clip_n_total": int(len(result)),
+        "theta_clip_n_finite": int(finite.sum()),
+        "theta_clip_n_inliers": int(inlier.sum()),
+        "theta_clip_n_outliers": int(outlier.sum()),
+        "theta_clip_used": bool(clipping_used),
+    }
+
+    return result, df_inliers, clip_info
+
+def robust_center_sigma_mad(values: np.ndarray) -> Dict[str, float]:
+    """
+    Calcula centro y sigma robustos usando mediana y MAD.
+
+    sigma = 1.4826 * MAD
+
+    Si MAD = 0, usa desviación estándar como fallback.
+    """
+
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+
+    if len(values) == 0:
+        return {
+            "center": np.nan,
+            "sigma": np.nan,
+            "mad": np.nan,
+            "n": 0,
+        }
+
+    center = float(np.median(values))
+    mad = float(np.median(np.abs(values - center)))
+    sigma = float(1.4826 * mad)
+
+    if not np.isfinite(sigma) or sigma == 0.0:
+        sigma = float(np.std(values))
+
+    return {
+        "center": center,
+        "sigma": sigma,
+        "mad": mad,
+        "n": int(len(values)),
+    }
+
+
+def iterative_theta_sigma_clip_refinement(
+    df: pd.DataFrame,
+    initial_apex_result: Dict[str, Any],
+    weight_col: Optional[str] = None,
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    nsigma: float = 3.0,
+    max_iter: int = 5,
+    min_sources: int = 3,
+    min_remaining: Optional[int] = None,
+    min_sin_lambda: float = 0.15,
+    min_pole_norm: float = 0.0,
+    apex_tolerance_deg: float = 1e-3,
+    threshold_tolerance_deg: float = 1e-4,
+    orient_with_motion: bool = True,
+    prefix: str = "theta_iter",
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Refinamiento iterativo del ápex usando sigma clipping sobre theta.
+
+    En cada iteración:
+        1. estima el ápex con los miembros actuales,
+        2. calcula el polo perfecto de cada estrella,
+        3. calcula theta_pole_axis,
+        4. conserva estrellas con:
+
+            theta <= median(theta) + nsigma * sigma_theta
+
+    donde sigma_theta se estima robustamente con MAD.
+
+    También conserva los cortes geométricos:
+        sin(lambda) >= min_sin_lambda
+        pole_norm > min_pole_norm
+
+    Retorna:
+        df_marked:
+            DataFrame original con columnas de diagnóstico del clipping final.
+
+        df_refined:
+            DataFrame solo con los miembros finales aceptados.
+
+        apex_refined:
+            resultado final de estimate_apex_and_antapex.
+
+        clip_info:
+            resumen global del clipping iterativo.
+
+        clip_history:
+            lista con el historial de cada iteración.
+    """
+
+    if min_remaining is None:
+        min_remaining = min_sources
+
+    min_remaining = max(int(min_remaining), int(min_sources))
+
+    if df is None or len(df) < min_sources:
+        clip_info = {
+            "theta_clip_used": False,
+            "theta_clip_stop_reason": "not_enough_input_sources",
+            "theta_clip_n_iterations": 0,
+            "theta_clip_nsigma": float(nsigma),
+            "theta_clip_max_iter": int(max_iter),
+            "theta_clip_n_initial": 0 if df is None else int(len(df)),
+            "theta_clip_n_final": 0 if df is None else int(len(df)),
+            "theta_clip_n_rejected": 0,
+        }
+
+        return df.copy(), df.copy(), initial_apex_result, clip_info, []
+
+    current_index = pd.Index(df.index)
+    history: List[Dict[str, Any]] = []
+
+    previous_apex_vector = None
+    previous_threshold = np.nan
+
+    stop_reason = "max_iter_reached"
+    last_apex_result = initial_apex_result
+
+    for iteration in range(int(max_iter)):
+        df_current_base = df.loc[current_index].copy()
+
+        if len(df_current_base) < min_sources:
+            stop_reason = "not_enough_sources_before_iteration"
+            break
+
+        if iteration == 0:
+            apex_result = initial_apex_result
+        else:
+            try:
+                apex_result = estimate_apex_and_antapex(
+                    df_current_base,
+                    weight_col=weight_col,
+                    orient_with_motion=orient_with_motion,
+                    min_sources=min_sources,
+                )
+            except ValueError:
+                stop_reason = "apex_estimation_failed"
+                break
+
+        last_apex_result = apex_result
+
+        apex_vector = apex_result["apex_vector"]
+
+        df_current = add_lambda_angle_from_apex(
+            df_current_base,
+            apex_vector=apex_vector,
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
+
+        iter_prefix = f"{prefix}_{iteration}"
+
+        df_current = add_perfect_poles_and_theta_from_apex(
+            df_current,
+            apex_vector=apex_vector,
+            prefix=iter_prefix,
+        )
+
+        theta_col = f"theta_pole_axis_{iter_prefix}_deg"
+
+        theta = df_current[theta_col].to_numpy(dtype=float)
+
+        valid_for_stats = np.isfinite(theta)
+
+        if min_sin_lambda is not None:
+            valid_for_stats &= (
+                df_current["sin_lambda"].notna().to_numpy()
+                & np.isfinite(df_current["sin_lambda"].to_numpy(dtype=float))
+                & (df_current["sin_lambda"].to_numpy(dtype=float) >= min_sin_lambda)
+            )
+
+        if min_pole_norm is not None:
+            valid_for_stats &= (
+                df_current["pole_norm"].notna().to_numpy()
+                & np.isfinite(df_current["pole_norm"].to_numpy(dtype=float))
+                & (df_current["pole_norm"].to_numpy(dtype=float) > min_pole_norm)
+            )
+
+        theta_for_stats = theta[valid_for_stats]
+
+        robust_stats = robust_center_sigma_mad(theta_for_stats)
+
+        center = robust_stats["center"]
+        sigma = robust_stats["sigma"]
+        mad = robust_stats["mad"]
+        n_stats = robust_stats["n"]
+
+        if n_stats == 0:
+            stop_reason = "no_valid_theta_values"
+            break
+
+        if not np.isfinite(sigma) or sigma == 0.0:
+            threshold = center
+            inlier_mask_local = valid_for_stats
+        else:
+            threshold = center + nsigma * sigma
+            inlier_mask_local = valid_for_stats & (theta <= threshold)
+
+        new_index = pd.Index(df_current.index[inlier_mask_local])
+
+        n_input_iter = int(len(df_current))
+        n_inliers_iter = int(len(new_index))
+        n_outliers_iter = int(n_input_iter - n_inliers_iter)
+
+        apex_change_deg = np.nan
+
+        if previous_apex_vector is not None:
+            apex_change_deg = angular_axis_error_between_vectors_deg(
+                apex_vector,
+                previous_apex_vector,
+            )
+
+        threshold_change_deg = np.nan
+
+        if np.isfinite(previous_threshold) and np.isfinite(threshold):
+            threshold_change_deg = float(abs(threshold - previous_threshold))
+
+        members_stable = new_index.equals(current_index)
+
+        history_row = {
+            "iteration": int(iteration),
+            "n_input": n_input_iter,
+            "n_valid_for_stats": int(n_stats),
+            "n_inliers": n_inliers_iter,
+            "n_outliers": n_outliers_iter,
+            "theta_center_deg": float(center) if np.isfinite(center) else np.nan,
+            "theta_mad_deg": float(mad) if np.isfinite(mad) else np.nan,
+            "theta_sigma_deg": float(sigma) if np.isfinite(sigma) else np.nan,
+            "theta_threshold_deg": float(threshold)
+            if np.isfinite(threshold)
+            else np.nan,
+            "apex_change_axis_deg": float(apex_change_deg)
+            if np.isfinite(apex_change_deg)
+            else np.nan,
+            "threshold_change_deg": float(threshold_change_deg)
+            if np.isfinite(threshold_change_deg)
+            else np.nan,
+            "members_stable": bool(members_stable),
+        }
+
+        history.append(history_row)
+
+        if n_inliers_iter < min_remaining:
+            stop_reason = "too_few_sources_after_clipping"
+            break
+
+        if members_stable:
+            current_index = new_index
+            stop_reason = "members_stable"
+            break
+
+        current_index = new_index
+
+        if (
+            iteration > 0
+            and np.isfinite(apex_change_deg)
+            and np.isfinite(threshold_change_deg)
+            and apex_change_deg < apex_tolerance_deg
+            and threshold_change_deg < threshold_tolerance_deg
+        ):
+            stop_reason = "apex_and_threshold_stable"
+            break
+
+        previous_apex_vector = apex_vector.copy()
+        previous_threshold = threshold
+
+    df_final_base = df.loc[current_index].copy()
+
+    if len(df_final_base) >= min_sources:
+        try:
+            apex_refined = estimate_apex_and_antapex(
+                df_final_base,
+                weight_col=weight_col,
+                orient_with_motion=orient_with_motion,
+                min_sources=min_sources,
+            )
+        except ValueError:
+            apex_refined = last_apex_result
+            stop_reason = "final_apex_estimation_failed_using_last"
+    else:
+        apex_refined = last_apex_result
+        stop_reason = "final_sample_too_small_using_last"
+
+    final_inlier_index = pd.Index(df_final_base.index)
+
+    df_marked = df.copy()
+
+    df_marked[f"{prefix}_final_is_inlier"] = df_marked.index.isin(
+        final_inlier_index
+    )
+    df_marked[f"{prefix}_final_is_outlier"] = ~df_marked[
+        f"{prefix}_final_is_inlier"
+    ]
+
+    df_marked = add_perfect_poles_and_theta_from_apex(
+        df_marked,
+        apex_vector=apex_refined["apex_vector"],
+        prefix=f"{prefix}_final",
+    )
+
+    df_refined = df_marked.loc[final_inlier_index].copy()
+
+    df_refined = add_lambda_angle_from_apex(
+        df_refined,
+        apex_vector=apex_refined["apex_vector"],
+        ra_col=ra_col,
+        dec_col=dec_col,
+    )
+
+    df_refined = add_perfect_poles_and_theta_from_apex(
+        df_refined,
+        apex_vector=apex_refined["apex_vector"],
+        prefix="refined",
+    )
+
+    df_refined["lambda_deg_refined"] = df_refined["lambda_deg"]
+    df_refined["sin_lambda_refined"] = df_refined["sin_lambda"]
+    df_refined["cos_lambda_refined"] = df_refined["cos_lambda"]
+
+    df_refined = add_pole_apex_error_comparison(
+        df_refined,
+        apex_vector=apex_refined["apex_vector"],
+        sin_lambda_col="sin_lambda_refined",
+        prefix="refined",
+    )
+
+    last_history = history[-1] if len(history) > 0 else {}
+
+    clip_info = {
+        "theta_clip_used": bool(len(history) > 0),
+        "theta_clip_stop_reason": stop_reason,
+        "theta_clip_n_iterations": int(len(history)),
+        "theta_clip_nsigma": float(nsigma),
+        "theta_clip_max_iter": int(max_iter),
+        "theta_clip_min_remaining": int(min_remaining),
+        "theta_clip_min_sin_lambda": float(min_sin_lambda),
+        "theta_clip_min_pole_norm": float(min_pole_norm),
+        "theta_clip_apex_tolerance_deg": float(apex_tolerance_deg),
+        "theta_clip_threshold_tolerance_deg": float(threshold_tolerance_deg),
+        "theta_clip_n_initial": int(len(df)),
+        "theta_clip_n_final": int(len(df_refined)),
+        "theta_clip_n_rejected": int(len(df) - len(df_refined)),
+        "theta_clip_final_center_deg": last_history.get(
+            "theta_center_deg",
+            np.nan,
+        ),
+        "theta_clip_final_sigma_deg": last_history.get(
+            "theta_sigma_deg",
+            np.nan,
+        ),
+        "theta_clip_final_threshold_deg": last_history.get(
+            "theta_threshold_deg",
+            np.nan,
+        ),
+        "theta_clip_final_apex_change_axis_deg": last_history.get(
+            "apex_change_axis_deg",
+            np.nan,
+        ),
+        "theta_clip_final_threshold_change_deg": last_history.get(
+            "threshold_change_deg",
+            np.nan,
+        ),
+    }
+
+    return df_marked, df_refined, apex_refined, clip_info, history
+
 
 # ============================================================
 # Apex estimation
@@ -690,7 +1399,7 @@ def estimate_apex_and_antapex(
     apex_coordinates = unit_vector_to_equatorial_radec(apex_vector)
     antapex_coordinates = unit_vector_to_equatorial_radec(antapex_vector)
 
-    pole_plane_residual = np.clip(np.abs(poles @ apex_vector), 0.0, 1.0)
+    pole_plane_residual = np.clip(poles @ apex_vector, -1.0, 1.0)
     pole_residual_deg = np.degrees(np.arcsin(pole_plane_residual))
 
     return {
@@ -736,6 +1445,7 @@ def apex_from_pole_cross_products(
     random_state: int = 42,
 ) -> Dict[str, Any]:
     """
+
     Estima el ápex usando intersecciones entre pares de polos.
 
     Cada par de polos p_i, p_j define una intersección:
@@ -1064,6 +1774,11 @@ def process_single_cluster(
     refine_apex: bool = True,
     min_sin_lambda: float = 0.15,
     min_pole_norm: float = 0.0,
+    theta_clip_nsigma: float = 3.0,
+    theta_clip_max_iter: int = 5,
+    theta_clip_min_remaining: Optional[int] = None,
+    theta_clip_apex_tolerance_deg: float = 1e-3,
+    theta_clip_threshold_tolerance_deg: float = 1e-4,
     true_apex_vector: Optional[np.ndarray] = None,
     true_apex_ra_deg: Optional[float] = None,
     true_apex_dec_deg: Optional[float] = None,
@@ -1134,9 +1849,22 @@ def process_single_cluster(
         dec_col=dec_col,
     )
 
+    df_initial = add_perfect_poles_and_theta_from_apex(
+        df_initial,
+        apex_vector=apex_initial["apex_vector"],
+        prefix="initial",
+    )
+
     df_initial["lambda_deg_initial"] = df_initial["lambda_deg"]
     df_initial["sin_lambda_initial"] = df_initial["sin_lambda"]
     df_initial["cos_lambda_initial"] = df_initial["cos_lambda"]
+
+    df_initial = add_pole_apex_error_comparison(
+        df_initial,
+        apex_vector=apex_initial["apex_vector"],
+        sin_lambda_col="sin_lambda_initial",
+        prefix="initial",
+    )
 
     df_initial["pm_total"] = np.sqrt(
         df_initial[pmra_col].astype(float) ** 2
@@ -1167,7 +1895,7 @@ def process_single_cluster(
     apex_initial_bootstrap_metrics = apex_bootstrap_stability_metrics(
         df=df_initial,
         reference_apex_vector=apex_initial["apex_vector"],
-        n_bootstrap=200,
+        n_bootstrap=2,
         sample_fraction=0.8,
         random_state=42,
         weight_col=effective_weight_col,
@@ -1179,73 +1907,151 @@ def process_single_cluster(
     apex_refined = apex_initial
     cross_refined = cross_initial
 
+    theta_clip_info = {
+        "theta_clip_used": False,
+        "theta_clip_stop_reason": "refine_apex_false",
+        "theta_clip_n_iterations": 0,
+        "theta_clip_nsigma": float(theta_clip_nsigma),
+        "theta_clip_max_iter": int(theta_clip_max_iter),
+        "theta_clip_n_initial": int(len(df_initial)),
+        "theta_clip_n_final": int(len(df_initial)),
+        "theta_clip_n_rejected": 0,
+    }
+
+    theta_clip_history: List[Dict[str, Any]] = []
+
     if refine_apex:
-        refinement_mask = (
-            df_initial["sin_lambda"].notna()
-            & np.isfinite(df_initial["sin_lambda"])
-            & (df_initial["sin_lambda"] >= min_sin_lambda)
-            & (df_initial["pole_norm"] > min_pole_norm)
+        (
+            df_initial,
+            df_refined,
+            apex_refined,
+            theta_clip_info,
+            theta_clip_history,
+        ) = iterative_theta_sigma_clip_refinement(
+            df=df_initial,
+            initial_apex_result=apex_initial,
+            weight_col=effective_weight_col,
+            ra_col=ra_col,
+            dec_col=dec_col,
+            nsigma=theta_clip_nsigma,
+            max_iter=theta_clip_max_iter,
+            min_sources=min_stars,
+            min_remaining=theta_clip_min_remaining
+            if theta_clip_min_remaining is not None
+            else min_stars,
+            min_sin_lambda=min_sin_lambda,
+            min_pole_norm=min_pole_norm,
+            apex_tolerance_deg=theta_clip_apex_tolerance_deg,
+            threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
+            orient_with_motion=True,
+            prefix="theta_iter",
         )
 
-        df_refined_candidate = df_initial[refinement_mask].copy()
+    else:
+        df_refined = add_lambda_angle_from_apex(
+            df_refined,
+            apex_vector=apex_refined["apex_vector"],
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
 
-        if len(df_refined_candidate) >= min_stars:
-            try:
-                apex_refined = estimate_apex_and_antapex(
-                    df_refined_candidate,
-                    weight_col=effective_weight_col,
-                    min_sources=min_stars,
-                )
+        df_refined = add_perfect_poles_and_theta_from_apex(
+            df_refined,
+            apex_vector=apex_refined["apex_vector"],
+            prefix="refined",
+        )
 
-                df_refined = add_lambda_angle_from_apex(
-                    df_refined_candidate,
-                    apex_vector=apex_refined["apex_vector"],
-                    ra_col=ra_col,
-                    dec_col=dec_col,
-                )
+        df_refined["lambda_deg_refined"] = df_refined["lambda_deg"]
+        df_refined["sin_lambda_refined"] = df_refined["sin_lambda"]
+        df_refined["cos_lambda_refined"] = df_refined["cos_lambda"]
 
-                df_refined["lambda_deg_refined"] = df_refined["lambda_deg"]
-                df_refined["sin_lambda_refined"] = df_refined["sin_lambda"]
-                df_refined["cos_lambda_refined"] = df_refined["cos_lambda"]
+    df_refined["pm_total"] = np.sqrt(
+        df_refined[pmra_col].astype(float) ** 2
+        + df_refined[pmdec_col].astype(float) ** 2
+    )
 
-                df_refined["pm_total"] = np.sqrt(
-                    df_refined[pmra_col].astype(float) ** 2
-                    + df_refined[pmdec_col].astype(float) ** 2
-                )
+    if "distance_pc" in df_refined.columns:
+        df_refined["vt_kms"] = (
+            KM_S_PER_AU_YR
+            * (df_refined["pm_total"] / 1000.0)
+            * df_refined["distance_pc"]
+        )
 
-                if "distance_pc" in df_refined.columns:
-                    df_refined["vt_kms"] = (
-                        KM_S_PER_AU_YR
-                        * (df_refined["pm_total"] / 1000.0)
-                        * df_refined["distance_pc"]
-                    )
+    try:
+        cross_refined = apex_from_pole_cross_products(
+            df_refined,
+            reference_apex_vector=apex_refined["apex_vector"],
+            weight_col=effective_weight_col,
+            pole_norm_min=min_pole_norm,
+            min_sources=min_stars,
+        )
+    except ValueError as exc:
+        print(
+            f"Cluster {cluster_id}: cross-product refined apex failed - {exc}"
+        )
+        cross_refined = None
 
-                try:
-                    cross_refined = apex_from_pole_cross_products(
-                        df_refined,
-                        reference_apex_vector=apex_refined["apex_vector"],
-                        weight_col=effective_weight_col,
-                        pole_norm_min=min_pole_norm,
-                        min_sources=min_stars,
-                    )
-                except ValueError as exc:
-                    print(
-                        f"Cluster {cluster_id}: cross-product refined apex "
-                        f"failed - {exc}"
-                    )
-                    cross_refined = None
 
-            except ValueError as exc:
-                print(
-                    f"Cluster {cluster_id}: refined apex failed - {exc}. "
-                    "Using initial apex."
-                )
+    if "theta_pole_refined_deg" not in df_refined.columns:
+        df_refined = add_perfect_poles_and_theta_from_apex(
+            df_refined,
+            apex_vector=apex_refined["apex_vector"],
+            prefix="refined",
+        )
 
-        else:
-            print(
-                f"Cluster {cluster_id}: only {len(df_refined_candidate)} "
-                "stars after refinement cut. Using initial apex."
-            )
+    if "lambda_deg_refined" not in df_refined.columns:
+        df_refined = add_lambda_angle_from_apex(
+            df_refined,
+            apex_vector=apex_refined["apex_vector"],
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
+
+        df_refined["lambda_deg_refined"] = df_refined["lambda_deg"]
+        df_refined["sin_lambda_refined"] = df_refined["sin_lambda"]
+        df_refined["cos_lambda_refined"] = df_refined["cos_lambda"]
+
+    # ============================================================
+    # Pole-apex residuals: geometric and direction-corrected
+    # ============================================================
+
+    if "sin_lambda_initial" not in df_initial.columns:
+        df_initial = add_lambda_angle_from_apex(
+            df_initial,
+            apex_vector=apex_initial["apex_vector"],
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
+
+        df_initial["lambda_deg_initial"] = df_initial["lambda_deg"]
+        df_initial["sin_lambda_initial"] = df_initial["sin_lambda"]
+        df_initial["cos_lambda_initial"] = df_initial["cos_lambda"]
+
+    df_initial = add_pole_apex_error_comparison(
+        df_initial,
+        apex_vector=apex_initial["apex_vector"],
+        sin_lambda_col="sin_lambda_initial",
+        prefix="initial",
+    )
+
+    if "sin_lambda_refined" not in df_refined.columns:
+        df_refined = add_lambda_angle_from_apex(
+            df_refined,
+            apex_vector=apex_refined["apex_vector"],
+            ra_col=ra_col,
+            dec_col=dec_col,
+        )
+
+        df_refined["lambda_deg_refined"] = df_refined["lambda_deg"]
+        df_refined["sin_lambda_refined"] = df_refined["sin_lambda"]
+        df_refined["cos_lambda_refined"] = df_refined["cos_lambda"]
+
+    df_refined = add_pole_apex_error_comparison(
+        df_refined,
+        apex_vector=apex_refined["apex_vector"],
+        sin_lambda_col="sin_lambda_refined",
+        prefix="refined",
+    )
 
     true_apex_coordinates = (
         unit_vector_to_equatorial_radec(true_apex_vector_resolved)
@@ -1321,6 +2127,12 @@ def process_single_cluster(
         **cross_initial_true_errors,
         **cross_refined_true_errors,
 
+        "theta_clip_info": theta_clip_info,
+        "theta_clip_history": theta_clip_history,
+
+        "data_initial": df_initial,
+        "data_refined": df_refined,
+
         "data_initial": df_initial,
         "data_refined": df_refined,
     }
@@ -1341,6 +2153,11 @@ def process_all_clusters(
     true_apex_vector: Optional[np.ndarray] = None,
     true_apex_ra_deg: Optional[float] = None,
     true_apex_dec_deg: Optional[float] = None,
+    theta_clip_nsigma: float = 3.0,
+    theta_clip_max_iter: int = 5,
+    theta_clip_min_remaining: Optional[int] = None,
+    theta_clip_apex_tolerance_deg: float = 1e-3,
+    theta_clip_threshold_tolerance_deg: float = 1e-4,
 ) -> List[Dict[str, Any]]:
     """
     Procesa todos los cluster_id presentes en el DataFrame.
@@ -1369,6 +2186,11 @@ def process_all_clusters(
             true_apex_vector=true_apex_vector,
             true_apex_ra_deg=true_apex_ra_deg,
             true_apex_dec_deg=true_apex_dec_deg,
+            theta_clip_nsigma=theta_clip_nsigma,
+            theta_clip_max_iter=theta_clip_max_iter,
+            theta_clip_min_remaining=theta_clip_min_remaining,
+            theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
+            theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
         )
 
         if cluster_result is not None:
@@ -1402,6 +2224,61 @@ def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
     apex_initial_bootstrap = result.get("apex_initial_bootstrap_metrics", {})
     apex_refined_bootstrap = result.get("apex_refined_bootstrap_metrics", {})
+
+    theta_clip_info = result.get("theta_clip_info", {})
+
+    data_initial = result.get("data_initial")
+    data_refined = result.get("data_refined")
+
+    def _nanmedian_col(df_data, col):
+        if df_data is None or col not in df_data.columns:
+            return np.nan
+
+        values = df_data[col].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return np.nan
+
+        return float(np.median(values))
+
+
+    def _nanrms_col(df_data, col):
+        if df_data is None or col not in df_data.columns:
+            return np.nan
+
+        values = df_data[col].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return np.nan
+
+        return float(np.sqrt(np.mean(values**2)))
+
+    def _nanmean_col(df_data, col):
+        if df_data is None or col not in df_data.columns:
+            return np.nan
+
+        values = df_data[col].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return np.nan
+
+        return float(np.mean(values))
+
+
+    def _nanpercentile_col(df_data, col, q):
+        if df_data is None or col not in df_data.columns:
+            return np.nan
+
+        values = df_data[col].to_numpy(dtype=float)
+        values = values[np.isfinite(values)]
+
+        if len(values) == 0:
+            return np.nan
+
+        return float(np.percentile(values, q))
 
     return {
         "cluster_id": result["cluster_id"],
@@ -1534,6 +2411,387 @@ def summarize_cluster_result(result: Dict[str, Any]) -> Dict[str, Any]:
             "cross_refined_axis_error_true_deg",
             np.nan,
         ),
+        "theta_pole_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "theta_pole_initial_deg",
+        ),
+        "theta_pole_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "theta_pole_initial_deg",
+        ),
+        "theta_pole_axis_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "theta_pole_axis_initial_deg",
+        ),
+        "theta_pole_axis_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "theta_pole_axis_initial_deg",
+        ),
+
+        "theta_pole_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "theta_pole_refined_deg",
+        ),
+        "theta_pole_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "theta_pole_refined_deg",
+        ),
+        "theta_pole_axis_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "theta_pole_axis_refined_deg",
+        ),
+        "theta_pole_axis_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "theta_pole_axis_refined_deg",
+        ),
+        "theta_clip_used": theta_clip_info.get("theta_clip_used", False),
+        "theta_clip_stop_reason": theta_clip_info.get(
+            "theta_clip_stop_reason",
+            None,
+        ),
+        "theta_clip_n_iterations": theta_clip_info.get(
+            "theta_clip_n_iterations",
+            0,
+        ),
+        "theta_clip_nsigma": theta_clip_info.get(
+            "theta_clip_nsigma",
+            np.nan,
+        ),
+        "theta_clip_n_initial": theta_clip_info.get(
+            "theta_clip_n_initial",
+            np.nan,
+        ),
+        "theta_clip_n_final": theta_clip_info.get(
+            "theta_clip_n_final",
+            np.nan,
+        ),
+        "theta_clip_n_rejected": theta_clip_info.get(
+            "theta_clip_n_rejected",
+            np.nan,
+        ),
+        "theta_clip_final_center_deg": theta_clip_info.get(
+            "theta_clip_final_center_deg",
+            np.nan,
+        ),
+        "theta_clip_final_sigma_deg": theta_clip_info.get(
+            "theta_clip_final_sigma_deg",
+            np.nan,
+        ),
+        "theta_clip_final_threshold_deg": theta_clip_info.get(
+            "theta_clip_final_threshold_deg",
+            np.nan,
+        ),
+        "theta_clip_final_apex_change_axis_deg": theta_clip_info.get(
+            "theta_clip_final_apex_change_axis_deg",
+            np.nan,
+        ),
+        "theta_clip_final_threshold_change_deg": theta_clip_info.get(
+            "theta_clip_final_threshold_change_deg",
+            np.nan,
+        ),
+        "lambda_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "lambda_deg_refined",
+        ),
+        "lambda_refined_p16_deg": _nanpercentile_col(
+            data_refined,
+            "lambda_deg_refined",
+            16,
+        ),
+        "lambda_refined_p84_deg": _nanpercentile_col(
+            data_refined,
+            "lambda_deg_refined",
+            84,
+        ),
+        "sin_lambda_refined_median": _nanmedian_col(
+            data_refined,
+            "sin_lambda_refined",
+        ),
+        "sin_lambda_refined_mean": _nanmean_col(
+            data_refined,
+            "sin_lambda_refined",
+        ),
+        "pole_norm_refined_median": _nanmedian_col(
+            data_refined,
+            "pole_norm",
+        ),
+        "pm_total_refined_median": _nanmedian_col(
+            data_refined,
+            "pm_total",
+        ),
+        "vt_kms_refined_median": _nanmedian_col(
+            data_refined,
+            "vt_kms",
+        ),
+        # ============================================================
+        # Pole-apex geometric residuals: initial
+        # ============================================================
+
+        "pole_apex_dot_initial_median": _nanmedian_col(
+            data_initial,
+            "pole_apex_dot_initial",
+        ),
+        "pole_apex_dot_initial_rms": _nanrms_col(
+            data_initial,
+            "pole_apex_dot_initial",
+        ),
+
+        "pole_apex_error_geom_signed_initial_mean_deg": _nanmean_col(
+            data_initial,
+            "pole_apex_error_geom_signed_initial_deg",
+        ),
+        "pole_apex_error_geom_signed_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_geom_signed_initial_deg",
+        ),
+        "pole_apex_error_geom_signed_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "pole_apex_error_geom_signed_initial_deg",
+        ),
+
+        "pole_apex_error_geom_abs_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_geom_abs_initial_deg",
+        ),
+        "pole_apex_error_geom_abs_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "pole_apex_error_geom_abs_initial_deg",
+        ),
+        "pole_apex_error_geom_abs_initial_p16_deg": _nanpercentile_col(
+            data_initial,
+            "pole_apex_error_geom_abs_initial_deg",
+            16,
+        ),
+        "pole_apex_error_geom_abs_initial_p84_deg": _nanpercentile_col(
+            data_initial,
+            "pole_apex_error_geom_abs_initial_deg",
+            84,
+        ),
+
+        # ============================================================
+        # Pole-apex direction-corrected residuals: initial
+        # ============================================================
+
+        "pole_apex_error_direction_ratio_initial_median": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_direction_ratio_initial",
+        ),
+        "pole_apex_error_direction_ratio_initial_rms": _nanrms_col(
+            data_initial,
+            "pole_apex_error_direction_ratio_initial",
+        ),
+
+        "pole_apex_error_direction_signed_initial_mean_deg": _nanmean_col(
+            data_initial,
+            "pole_apex_error_direction_signed_initial_deg",
+        ),
+        "pole_apex_error_direction_signed_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_direction_signed_initial_deg",
+        ),
+        "pole_apex_error_direction_signed_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "pole_apex_error_direction_signed_initial_deg",
+        ),
+
+        "pole_apex_error_direction_abs_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_direction_abs_initial_deg",
+        ),
+        "pole_apex_error_direction_abs_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "pole_apex_error_direction_abs_initial_deg",
+        ),
+        "pole_apex_error_direction_abs_initial_p16_deg": _nanpercentile_col(
+            data_initial,
+            "pole_apex_error_direction_abs_initial_deg",
+            16,
+        ),
+        "pole_apex_error_direction_abs_initial_p84_deg": _nanpercentile_col(
+            data_initial,
+            "pole_apex_error_direction_abs_initial_deg",
+            84,
+        ),
+
+        # ============================================================
+        # Pole-apex inverse direction residuals: initial
+        # ============================================================
+
+        "pole_apex_error_direction_inverse_ratio_initial_median": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_ratio_initial",
+        ),
+        "pole_apex_error_direction_inverse_ratio_initial_rms": _nanrms_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_ratio_initial",
+        ),
+
+        "pole_apex_error_direction_inverse_signed_initial_mean_deg": _nanmean_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_signed_initial_deg",
+        ),
+        "pole_apex_error_direction_inverse_signed_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_signed_initial_deg",
+        ),
+        "pole_apex_error_direction_inverse_signed_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_signed_initial_deg",
+        ),
+
+        "pole_apex_error_direction_inverse_abs_initial_median_deg": _nanmedian_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_abs_initial_deg",
+        ),
+        "pole_apex_error_direction_inverse_abs_initial_rms_deg": _nanrms_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_abs_initial_deg",
+        ),
+        "pole_apex_error_direction_inverse_abs_initial_p16_deg": _nanpercentile_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_abs_initial_deg",
+            16,
+        ),
+        "pole_apex_error_direction_inverse_abs_initial_p84_deg": _nanpercentile_col(
+            data_initial,
+            "pole_apex_error_direction_inverse_abs_initial_deg",
+            84,
+        ),
+
+        # ============================================================
+        # Pole-apex geometric residuals: refined
+        # ============================================================
+
+        "pole_apex_dot_refined_median": _nanmedian_col(
+            data_refined,
+            "pole_apex_dot_refined",
+        ),
+        "pole_apex_dot_refined_rms": _nanrms_col(
+            data_refined,
+            "pole_apex_dot_refined",
+        ),
+
+        "pole_apex_error_geom_signed_refined_mean_deg": _nanmean_col(
+            data_refined,
+            "pole_apex_error_geom_signed_refined_deg",
+        ),
+        "pole_apex_error_geom_signed_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_geom_signed_refined_deg",
+        ),
+        "pole_apex_error_geom_signed_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "pole_apex_error_geom_signed_refined_deg",
+        ),
+
+        "pole_apex_error_geom_abs_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_geom_abs_refined_deg",
+        ),
+        "pole_apex_error_geom_abs_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "pole_apex_error_geom_abs_refined_deg",
+        ),
+        "pole_apex_error_geom_abs_refined_p16_deg": _nanpercentile_col(
+            data_refined,
+            "pole_apex_error_geom_abs_refined_deg",
+            16,
+        ),
+        "pole_apex_error_geom_abs_refined_p84_deg": _nanpercentile_col(
+            data_refined,
+            "pole_apex_error_geom_abs_refined_deg",
+            84,
+        ),
+
+        # ============================================================
+        # Pole-apex direction-corrected residuals: refined
+        # ============================================================
+
+        "pole_apex_error_direction_ratio_refined_median": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_direction_ratio_refined",
+        ),
+        "pole_apex_error_direction_ratio_refined_rms": _nanrms_col(
+            data_refined,
+            "pole_apex_error_direction_ratio_refined",
+        ),
+
+        "pole_apex_error_direction_signed_refined_mean_deg": _nanmean_col(
+            data_refined,
+            "pole_apex_error_direction_signed_refined_deg",
+        ),
+        "pole_apex_error_direction_signed_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_direction_signed_refined_deg",
+        ),
+        "pole_apex_error_direction_signed_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "pole_apex_error_direction_signed_refined_deg",
+        ),
+
+        "pole_apex_error_direction_abs_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_direction_abs_refined_deg",
+        ),
+        "pole_apex_error_direction_abs_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "pole_apex_error_direction_abs_refined_deg",
+        ),
+        "pole_apex_error_direction_abs_refined_p16_deg": _nanpercentile_col(
+            data_refined,
+            "pole_apex_error_direction_abs_refined_deg",
+            16,
+        ),
+        "pole_apex_error_direction_abs_refined_p84_deg": _nanpercentile_col(
+            data_refined,
+            "pole_apex_error_direction_abs_refined_deg",
+            84,
+        ),
+
+        # ============================================================
+        # Pole-apex inverse direction residuals: refined
+        # ============================================================
+
+        "pole_apex_error_direction_inverse_ratio_refined_median": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_ratio_refined",
+        ),
+        "pole_apex_error_direction_inverse_ratio_refined_rms": _nanrms_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_ratio_refined",
+        ),
+
+        "pole_apex_error_direction_inverse_signed_refined_mean_deg": _nanmean_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_signed_refined_deg",
+        ),
+        "pole_apex_error_direction_inverse_signed_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_signed_refined_deg",
+        ),
+        "pole_apex_error_direction_inverse_signed_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_signed_refined_deg",
+        ),
+
+        "pole_apex_error_direction_inverse_abs_refined_median_deg": _nanmedian_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_abs_refined_deg",
+        ),
+        "pole_apex_error_direction_inverse_abs_refined_rms_deg": _nanrms_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_abs_refined_deg",
+        ),
+        "pole_apex_error_direction_inverse_abs_refined_p16_deg": _nanpercentile_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_abs_refined_deg",
+            16,
+        ),
+        "pole_apex_error_direction_inverse_abs_refined_p84_deg": _nanpercentile_col(
+            data_refined,
+            "pole_apex_error_direction_inverse_abs_refined_deg",
+            84,
+        ),
     }
 
 
@@ -1570,6 +2828,11 @@ def run_cluster_analysis_from_dataframe(
     true_apex_vector: Optional[np.ndarray] = None,
     true_apex_ra_deg: Optional[float] = None,
     true_apex_dec_deg: Optional[float] = None,
+    theta_clip_nsigma: float = 3.0,
+    theta_clip_max_iter: int = 5,
+    theta_clip_min_remaining: Optional[int] = None,
+    theta_clip_apex_tolerance_deg: float = 1e-3,
+    theta_clip_threshold_tolerance_deg: float = 1e-4,
 ) -> Dict[str, Any]:
     """
     Ejecuta el análisis completo desde un DataFrame de pandas ya cargado.
@@ -1629,6 +2892,11 @@ def run_cluster_analysis_from_dataframe(
             true_apex_vector=true_apex_vector,
             true_apex_ra_deg=true_apex_ra_deg,
             true_apex_dec_deg=true_apex_dec_deg,
+            theta_clip_nsigma=theta_clip_nsigma,
+            theta_clip_max_iter=theta_clip_max_iter,
+            theta_clip_min_remaining=theta_clip_min_remaining,
+            theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
+            theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
         )
 
         summary = (
@@ -1658,6 +2926,11 @@ def run_cluster_analysis_from_dataframe(
         true_apex_vector=true_apex_vector,
         true_apex_ra_deg=true_apex_ra_deg,
         true_apex_dec_deg=true_apex_dec_deg,
+        theta_clip_nsigma=theta_clip_nsigma,
+        theta_clip_max_iter=theta_clip_max_iter,
+        theta_clip_min_remaining=theta_clip_min_remaining,
+        theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
+        theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
     )
 
     summary_df = summarize_all_cluster_results(cluster_results)
@@ -1696,6 +2969,11 @@ def run_cluster_analysis(
     true_apex_vector: Optional[np.ndarray] = None,
     true_apex_ra_deg: Optional[float] = None,
     true_apex_dec_deg: Optional[float] = None,
+    theta_clip_nsigma: float = 3.0,
+    theta_clip_max_iter: int = 5,
+    theta_clip_min_remaining: Optional[int] = None,
+    theta_clip_apex_tolerance_deg: float = 1e-3,
+    theta_clip_threshold_tolerance_deg: float = 1e-4,
 ) -> Dict[str, Any]:
     """
     Ejecuta el análisis completo desde un archivo CSV.
@@ -1727,6 +3005,11 @@ def run_cluster_analysis(
         true_apex_vector=true_apex_vector,
         true_apex_ra_deg=true_apex_ra_deg,
         true_apex_dec_deg=true_apex_dec_deg,
+        theta_clip_nsigma=theta_clip_nsigma,
+        theta_clip_max_iter=theta_clip_max_iter,
+        theta_clip_min_remaining=theta_clip_min_remaining,
+        theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
+        theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
     )
 
 
