@@ -1,0 +1,17 @@
+,value
+n_iterations,100.0
+apex_error_mean_deg,0.07159375370727282
+apex_error_std_deg,0.03642476694380787
+apex_error_median_deg,0.0685998409381897
+apex_error_p16_deg,0.03473723076645613
+apex_error_p84_deg,0.1054795786997287
+apex_error_p025_deg,0.019123585810735064
+apex_error_p975_deg,0.14848001134341246
+observational_error_median_deg,0.01032618419989567
+observational_error_p84_deg,0.019092082356741036
+intrinsic_error_median_deg,0.06766682025122131
+intrinsic_error_p84_deg,0.10360411147383383
+speed_mean_kms,24.990865499979023
+speed_std_kms,0.05079715856686364
+speed_p16_kms,24.935012527950434
+speed_p84_kms,25.036504320532853

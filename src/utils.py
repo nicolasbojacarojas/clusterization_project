@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -7,7 +11,13 @@ import matplotlib.pyplot as plt
 from typing import Optional
 
 from astropy import units as u
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import (
+    CartesianDifferential,
+    CartesianRepresentation,
+    Galactic,
+    ICRS,
+    SkyCoord,
+)
 
 try:
     from IPython.display import display
@@ -3879,3 +3889,753 @@ def plot_apex_error_scatter(
     plt.show()
 
     return fig, ax
+
+@dataclass
+class ApexResult:
+    """Resultados cinemáticos del cálculo del ápex."""
+
+    n_stars: int
+
+    # Ápex y antápex en ICRS
+    apex_ra_deg: float
+    apex_dec_deg: float
+    antapex_ra_deg: float
+    antapex_dec_deg: float
+
+    # Ápex en coordenadas galácticas
+    apex_l_deg: float
+    apex_b_deg: float
+
+    # Velocidad media heliocéntrica cartesiana ICRS
+    vx_mean_kms: float
+    vy_mean_kms: float
+    vz_mean_kms: float
+    speed_mean_kms: float
+
+    # Dispersiones cinemáticas
+    sigma_vx_rms_kms: float
+    sigma_vy_rms_kms: float
+    sigma_vz_rms_kms: float
+    sigma_3d_rms_kms: float
+    sigma_1d_rms_kms: float
+
+    # Dispersión en dirección del movimiento
+    sigma_apex_rms_deg: float
+
+    # Incertidumbres bootstrap del ápex
+    apex_ra_bootstrap_std_deg: float
+    apex_dec_bootstrap_std_deg: float
+    apex_angular_bootstrap_rms_deg: float
+
+    # Tabla con resultados individuales
+    stars: pd.DataFrame
+
+
+def calcular_apex_3d_gaia(
+    data: pd.DataFrame,
+    ra_col: str = "ra",
+    dec_col: str = "dec",
+    parallax_col: str = "parallax",
+    pmra_col: str = "pmra",
+    pmdec_col: str = "pmdec",
+    rv_col: str = "radial_velocity",
+    weight_col: Optional[str] = None,
+    source_id_col: Optional[str] = "source_id",
+    min_parallax: float = 0.0,
+    sigma_clip: Optional[float] = 3.0,
+    max_clip_iterations: int = 5,
+    bootstrap_samples: int = 1000,
+    random_state: Optional[int] = 42,
+) -> ApexResult:
+    """
+    Calcula el ápex de un cúmulo usando astrometría y velocidad radial de Gaia.
+
+    Parámetros
+    ----------
+    data
+        DataFrame que contiene ra, dec, parallax, pmra, pmdec y
+        radial_velocity.
+
+    ra_col, dec_col
+        Ascensión recta y declinación en grados.
+
+    parallax_col
+        Paralaje en milisegundos de arco.
+
+    pmra_col, pmdec_col
+        Movimientos propios en mas/año. Se asume que ``pmra`` corresponde
+        a mu_alpha* = mu_alpha cos(dec), como en Gaia.
+
+    rv_col
+        Velocidad radial heliocéntrica en km/s.
+
+    weight_col
+        Columna opcional de pesos. Puede contener probabilidades de
+        pertenencia o pesos derivados de incertidumbres.
+
+    source_id_col
+        Columna identificadora que será conservada en la salida.
+
+    min_parallax
+        Paralaje mínima permitida en mas.
+
+    sigma_clip
+        Umbral opcional para eliminar estrellas cinemáticamente discrepantes.
+        El clipping se aplica sobre la norma del residual 3D. Use None para
+        desactivarlo.
+
+    max_clip_iterations
+        Máximo número de iteraciones de sigma clipping.
+
+    bootstrap_samples
+        Número de remuestreos bootstrap usados para estimar la incertidumbre
+        del ápex. Use 0 para desactivarlo.
+
+    random_state
+        Semilla del generador aleatorio.
+
+    Retorna
+    -------
+    ApexResult
+        Resultados globales y tabla de resultados por estrella.
+
+    Notas
+    -----
+    La dispersión se calcula sobre los residuales
+
+        delta_v_i = v_i - <v>,
+
+    imponiendo media residual igual a cero. Por tanto,
+
+        sigma_RMS = sqrt(sum(w_i * delta_i**2) / sum(w_i)).
+
+    No se vuelve a estimar o sustraer la media de los residuales dentro de la
+    expresión de la dispersión.
+    """
+
+    required = [
+        ra_col,
+        dec_col,
+        parallax_col,
+        pmra_col,
+        pmdec_col,
+        rv_col,
+    ]
+
+    missing = [column for column in required if column not in data.columns]
+    if missing:
+        raise KeyError(
+            "Faltan las siguientes columnas obligatorias: "
+            + ", ".join(missing)
+        )
+
+    if weight_col is not None and weight_col not in data.columns:
+        raise KeyError(f"No existe la columna de pesos {weight_col!r}.")
+
+    columns = required.copy()
+
+    if weight_col is not None:
+        columns.append(weight_col)
+
+    if source_id_col is not None and source_id_col in data.columns:
+        columns.append(source_id_col)
+
+    stars = data.loc[:, list(dict.fromkeys(columns))].copy()
+
+    # Conversión segura a valores numéricos.
+    for column in required:
+        stars[column] = pd.to_numeric(stars[column], errors="coerce")
+
+    if weight_col is not None:
+        stars[weight_col] = pd.to_numeric(
+            stars[weight_col], errors="coerce"
+        )
+
+    valid = np.ones(len(stars), dtype=bool)
+
+    for column in required:
+        valid &= np.isfinite(stars[column].to_numpy(dtype=float))
+
+    valid &= stars[parallax_col].to_numpy(dtype=float) > min_parallax
+
+    if weight_col is not None:
+        weights_input = stars[weight_col].to_numpy(dtype=float)
+        valid &= np.isfinite(weights_input)
+        valid &= weights_input > 0.0
+
+    stars = stars.loc[valid].reset_index(drop=True)
+
+    if len(stars) < 3:
+        raise ValueError(
+            "Se necesitan al menos tres estrellas con astrometría, "
+            "paralaje y velocidad radial válidas."
+        )
+
+    parallax = stars[parallax_col].to_numpy(dtype=float)
+
+    # Para paralajes de buena señal/ruido:
+    # distancia [pc] = 1000 / parallax [mas].
+    distance_pc = 1000.0 / parallax
+
+    coord = SkyCoord(
+        ra=stars[ra_col].to_numpy(dtype=float) * u.deg,
+        dec=stars[dec_col].to_numpy(dtype=float) * u.deg,
+        distance=distance_pc * u.pc,
+        pm_ra_cosdec=stars[pmra_col].to_numpy(dtype=float)
+        * u.mas
+        / u.yr,
+        pm_dec=stars[pmdec_col].to_numpy(dtype=float)
+        * u.mas
+        / u.yr,
+        radial_velocity=stars[rv_col].to_numpy(dtype=float)
+        * u.km
+        / u.s,
+        frame=ICRS(),
+    )
+
+    velocity = coord.velocity.d_xyz.to_value(u.km / u.s).T
+
+    if weight_col is None:
+        weights = np.ones(len(stars), dtype=float)
+    else:
+        weights = stars[weight_col].to_numpy(dtype=float)
+
+    def weighted_mean_vector(
+        vectors: np.ndarray,
+        vector_weights: np.ndarray,
+    ) -> np.ndarray:
+        return np.average(vectors, axis=0, weights=vector_weights)
+
+    def rms_about_zero(
+        values: np.ndarray,
+        value_weights: np.ndarray,
+    ) -> float:
+        """
+        RMS ponderado respecto a cero.
+
+        No sustrae la media de ``values``.
+        """
+        return float(
+            np.sqrt(
+                np.average(
+                    np.asarray(values, dtype=float) ** 2,
+                    weights=value_weights,
+                )
+            )
+        )
+
+    def vector_to_icrs(vector: np.ndarray) -> SkyCoord:
+        norm = np.linalg.norm(vector)
+
+        if not np.isfinite(norm) or norm <= 0.0:
+            raise ValueError(
+                "El vector de velocidad media tiene módulo nulo o inválido."
+            )
+
+        unit_vector = vector / norm
+
+        return SkyCoord(
+            CartesianRepresentation(
+                unit_vector[0] * u.one,
+                unit_vector[1] * u.one,
+                unit_vector[2] * u.one,
+            ),
+            frame=ICRS(),
+        )
+
+    # ------------------------------------------------------------------
+    # Clipping cinemático iterativo
+    # ------------------------------------------------------------------
+    selected = np.ones(len(stars), dtype=bool)
+
+    if sigma_clip is not None:
+        if sigma_clip <= 0:
+            raise ValueError("sigma_clip debe ser positivo o None.")
+
+        for _ in range(max_clip_iterations):
+            mean_velocity = weighted_mean_vector(
+                velocity[selected],
+                weights[selected],
+            )
+
+            residual_velocity = velocity - mean_velocity
+            residual_norm = np.linalg.norm(residual_velocity, axis=1)
+
+            selected_residuals = residual_norm[selected]
+            selected_weights = weights[selected]
+
+            # RMS alrededor de cero, tal como se solicita.
+            scale = rms_about_zero(
+                selected_residuals,
+                selected_weights,
+            )
+
+            if not np.isfinite(scale) or scale <= 0.0:
+                break
+
+            new_selected = selected & (
+                residual_norm <= sigma_clip * scale
+            )
+
+            if new_selected.sum() < 3:
+                break
+
+            if np.array_equal(new_selected, selected):
+                break
+
+            selected = new_selected
+
+    stars = stars.loc[selected].reset_index(drop=True)
+    velocity = velocity[selected]
+    weights = weights[selected]
+    distance_pc = distance_pc[selected]
+
+    if len(stars) < 3:
+        raise ValueError(
+            "Después del filtrado quedaron menos de tres estrellas."
+        )
+
+    # ------------------------------------------------------------------
+    # Velocidad media y dirección del ápex
+    # ------------------------------------------------------------------
+    mean_velocity = weighted_mean_vector(velocity, weights)
+    mean_speed = float(np.linalg.norm(mean_velocity))
+
+    apex_icrs = vector_to_icrs(mean_velocity)
+    antapex_icrs = vector_to_icrs(-mean_velocity)
+    apex_galactic = apex_icrs.transform_to(Galactic())
+
+    # ------------------------------------------------------------------
+    # Residuales respecto al movimiento común
+    # ------------------------------------------------------------------
+    residual_velocity = velocity - mean_velocity
+
+    residual_vx = residual_velocity[:, 0]
+    residual_vy = residual_velocity[:, 1]
+    residual_vz = residual_velocity[:, 2]
+    residual_speed = np.linalg.norm(residual_velocity, axis=1)
+
+    sigma_vx = rms_about_zero(residual_vx, weights)
+    sigma_vy = rms_about_zero(residual_vy, weights)
+    sigma_vz = rms_about_zero(residual_vz, weights)
+
+    # RMS del módulo del residual tridimensional:
+    #
+    # sqrt(<dv_x² + dv_y² + dv_z²>)
+    sigma_3d = rms_about_zero(residual_speed, weights)
+
+    # Dispersión equivalente por dimensión:
+    #
+    # sigma_1D = sigma_3D / sqrt(3)
+    sigma_1d = sigma_3d / np.sqrt(3.0)
+
+    # ------------------------------------------------------------------
+    # Dispersión angular de las velocidades individuales
+    # ------------------------------------------------------------------
+
+    # Módulo de la velocidad tridimensional de cada estrella.
+    individual_speeds = np.linalg.norm(velocity, axis=1)
+
+    # Solo las velocidades con módulo positivo tienen una dirección válida.
+    valid_direction = (
+        np.isfinite(individual_speeds)
+        & (individual_speeds > 0.0)
+    )
+
+    # Vector unitario de velocidad de cada estrella.
+    individual_unit_vectors = np.full(
+        velocity.shape,
+        np.nan,
+        dtype=float,
+    )
+
+    individual_unit_vectors[valid_direction] = (
+        velocity[valid_direction]
+        / individual_speeds[valid_direction, None]
+    )
+
+    # Vector unitario que apunta hacia el ápex medio del cúmulo.
+    if not np.isfinite(mean_speed) or mean_speed <= 0.0:
+        raise ValueError(
+            "La velocidad media del cúmulo tiene módulo nulo o inválido."
+        )
+
+    apex_unit_vector = mean_velocity / mean_speed
+
+    # Producto punto entre cada dirección de velocidad y el ápex.
+    dot_products = np.full(len(stars), np.nan, dtype=float)
+
+    dot_products[valid_direction] = (
+        individual_unit_vectors[valid_direction]
+        @ apex_unit_vector
+    )
+
+    # Evita errores numéricos ligeramente fuera de [-1, 1].
+    dot_products[valid_direction] = np.clip(
+        dot_products[valid_direction],
+        -1.0,
+        1.0,
+    )
+
+    # Residual angular individual:
+    #
+    # theta_i = arccos(vhat_i · ahat)
+    #
+    # Representa la separación angular entre la dirección de movimiento
+    # de cada estrella y la dirección media del ápex.
+    angular_residual_deg = np.full(
+        len(stars),
+        np.nan,
+        dtype=float,
+    )
+
+    angular_residual_deg[valid_direction] = np.degrees(
+        np.arccos(dot_products[valid_direction])
+    )
+
+    # Cuadrado del residual angular individual.
+    #
+    # Esta es la cantidad que aporta cada estrella al cálculo del RMS:
+    #
+    # RMS = sqrt(sum(w_i * theta_i²) / sum(w_i))
+    angular_residual_squared_deg2 = angular_residual_deg**2
+
+    # RMS angular global ponderado del cúmulo.
+    sigma_apex_rms_deg = rms_about_zero(
+        angular_residual_deg[valid_direction],
+        weights[valid_direction],
+    )
+
+    # Aporte ponderado no normalizado de cada estrella:
+    #
+    # w_i * theta_i²
+    angular_weighted_squared_contribution = np.full(
+        len(stars),
+        np.nan,
+        dtype=float,
+    )
+
+    angular_weighted_squared_contribution[valid_direction] = (
+        weights[valid_direction]
+        * angular_residual_squared_deg2[valid_direction]
+    )
+
+    # Contribución fraccional de cada estrella a la suma cuadrática total.
+    #
+    # La suma de esta columna para estrellas válidas debe ser aproximadamente 1.
+    total_angular_squared_contribution = np.nansum(
+        angular_weighted_squared_contribution
+    )
+
+    angular_fractional_contribution = np.full(
+        len(stars),
+        np.nan,
+        dtype=float,
+    )
+
+    if (
+        np.isfinite(total_angular_squared_contribution)
+        and total_angular_squared_contribution > 0.0
+    ):
+        angular_fractional_contribution[valid_direction] = (
+            angular_weighted_squared_contribution[valid_direction]
+            / total_angular_squared_contribution
+        )
+
+    # Residual angular expresado en unidades del RMS global.
+    #
+    # Ejemplo:
+    #   valor = 1.0 -> la estrella está a una distancia angular igual al RMS
+    #   valor = 2.0 -> la estrella está a dos veces el RMS
+    angular_residual_over_rms = np.full(
+        len(stars),
+        np.nan,
+        dtype=float,
+    )
+
+    if (
+        np.isfinite(sigma_apex_rms_deg)
+        and sigma_apex_rms_deg > 0.0
+    ):
+        angular_residual_over_rms[valid_direction] = (
+            angular_residual_deg[valid_direction]
+            / sigma_apex_rms_deg
+        )
+
+    # Indicadores prácticos de posibles estrellas discrepantes.
+    angular_outlier_2rms = np.zeros(len(stars), dtype=bool)
+    angular_outlier_3rms = np.zeros(len(stars), dtype=bool)
+
+    angular_outlier_2rms[valid_direction] = (
+        angular_residual_over_rms[valid_direction] > 2.0
+    )
+
+    angular_outlier_3rms[valid_direction] = (
+        angular_residual_over_rms[valid_direction] > 3.0
+    )
+
+    # ------------------------------------------------------------------
+    # Bootstrap del ápex
+    # ------------------------------------------------------------------
+    rng = np.random.default_rng(random_state)
+
+    bootstrap_ra = []
+    bootstrap_dec = []
+    bootstrap_separation = []
+
+    if bootstrap_samples > 0:
+        probabilities = weights / np.sum(weights)
+        n_stars = len(stars)
+
+        for _ in range(bootstrap_samples):
+            indices = rng.choice(
+                n_stars,
+                size=n_stars,
+                replace=True,
+                p=probabilities,
+            )
+
+            # Media ponderada de la muestra bootstrap.
+            #
+            # Los índices se extraen usando probabilidades derivadas de
+            # los pesos originales. Dentro de cada muestra se conservan
+            # también los pesos de las estrellas seleccionadas.
+            bootstrap_vector = weighted_mean_vector(
+                velocity[indices],
+                weights[indices],
+            )
+
+            bootstrap_norm = np.linalg.norm(bootstrap_vector)
+
+            if (
+                not np.isfinite(bootstrap_norm)
+                or bootstrap_norm <= 0.0
+            ):
+                continue
+
+            bootstrap_apex = vector_to_icrs(bootstrap_vector)
+
+            bootstrap_ra.append(
+                bootstrap_apex.ra.wrap_at(360.0 * u.deg).deg
+            )
+
+            bootstrap_dec.append(
+                bootstrap_apex.dec.deg
+            )
+
+            bootstrap_separation.append(
+                bootstrap_apex.separation(apex_icrs).deg
+            )
+
+    if bootstrap_ra:
+        bootstrap_ra = np.asarray(
+            bootstrap_ra,
+            dtype=float,
+        )
+
+        bootstrap_dec = np.asarray(
+            bootstrap_dec,
+            dtype=float,
+        )
+
+        bootstrap_separation = np.asarray(
+            bootstrap_separation,
+            dtype=float,
+        )
+
+        # La RA es una variable circular.
+        delta_ra = (
+            (
+                bootstrap_ra
+                - apex_icrs.ra.deg
+                + 180.0
+            )
+            % 360.0
+            - 180.0
+        )
+
+        # Proyección de la diferencia de RA en el plano tangente.
+        delta_ra_projected = (
+            delta_ra
+            * np.cos(apex_icrs.dec.to_value(u.rad))
+        )
+
+        # RMS de las fluctuaciones bootstrap en RA.
+        ra_bootstrap_std = float(
+            np.sqrt(
+                np.mean(delta_ra_projected**2)
+            )
+        )
+
+        # RMS de las fluctuaciones bootstrap en Dec.
+        dec_bootstrap_std = float(
+            np.sqrt(
+                np.mean(
+                    (
+                        bootstrap_dec
+                        - apex_icrs.dec.deg
+                    )
+                    ** 2
+                )
+            )
+        )
+
+        # RMS de la separación angular entre cada ápex bootstrap
+        # y el ápex calculado con la muestra completa.
+        angular_bootstrap_rms = float(
+            np.sqrt(
+                np.mean(bootstrap_separation**2)
+            )
+        )
+
+    else:
+        ra_bootstrap_std = np.nan
+        dec_bootstrap_std = np.nan
+        angular_bootstrap_rms = np.nan
+
+    # ------------------------------------------------------------------
+    # Tabla individual de diagnóstico
+    # ------------------------------------------------------------------
+
+    # Distancia estimada.
+    stars["distance_pc"] = distance_pc
+
+    # Velocidades cartesianas ICRS.
+    stars["velocity_x_icrs_kms"] = velocity[:, 0]
+    stars["velocity_y_icrs_kms"] = velocity[:, 1]
+    stars["velocity_z_icrs_kms"] = velocity[:, 2]
+    stars["speed_3d_kms"] = individual_speeds
+
+    # Residuales de velocidad respecto al movimiento medio.
+    stars["residual_vx_kms"] = residual_vx
+    stars["residual_vy_kms"] = residual_vy
+    stars["residual_vz_kms"] = residual_vz
+    stars["residual_speed_3d_kms"] = residual_speed
+
+    # ------------------------------------------------------------------
+    # Información angular por estrella
+    # ------------------------------------------------------------------
+
+    # Ángulo individual entre la velocidad de la estrella y el ápex.
+    #
+    # Esta es la columna principal que debes consultar.
+    stars["apex_angular_residual_deg"] = (
+        angular_residual_deg
+    )
+
+    # Se conserva también el nombre anterior por compatibilidad.
+    stars["velocity_apex_angular_residual_deg"] = (
+        angular_residual_deg
+    )
+
+    # theta_i²: contribución individual antes de aplicar pesos.
+    stars["apex_angular_residual_squared_deg2"] = (
+        angular_residual_squared_deg2
+    )
+
+    # w_i * theta_i²: contribución ponderada no normalizada.
+    stars["apex_angular_weighted_contribution_deg2"] = (
+        angular_weighted_squared_contribution
+    )
+
+    # Fracción del total cuadrático aportada por cada estrella.
+    #
+    # La suma de esta columna es aproximadamente 1.
+    stars["apex_angular_fractional_contribution"] = (
+        angular_fractional_contribution
+    )
+
+    # Separación angular individual dividida entre el RMS global.
+    stars["apex_angular_residual_over_rms"] = (
+        angular_residual_over_rms
+    )
+
+    # Indicadores simples de estrellas alejadas más de 2 o 3 RMS.
+    stars["apex_angular_outlier_2rms"] = (
+        angular_outlier_2rms
+    )
+
+    stars["apex_angular_outlier_3rms"] = (
+        angular_outlier_3rms
+    )
+
+    # RMS angular global repetido en cada fila.
+    #
+    # Este valor será el mismo para todas las estrellas porque es una
+    # propiedad global del conjunto, no una propiedad individual.
+    stars["cluster_apex_angular_rms_deg"] = (
+        sigma_apex_rms_deg
+    )
+
+    # Pesos cinemáticos utilizados.
+    stars["kinematic_weight"] = weights
+
+    # RA de la dirección de velocidad de cada estrella
+    velocity_direction_ra_deg = (
+        np.degrees(
+            np.arctan2(
+                individual_unit_vectors[:, 1],
+                individual_unit_vectors[:, 0],
+            )
+        )
+        % 360.0
+    )
+
+    # Diferencia de RA envuelta en el intervalo [-180, 180)
+    delta_ra_deg = (
+        (
+            velocity_direction_ra_deg
+            - apex_icrs.ra.deg
+            + 180.0
+        )
+        % 360.0
+        - 180.0
+    )
+
+    # Asignar signo a la separación angular:
+    # positivo: dirección al este del ápex
+    # negativo: dirección al oeste del ápex
+    signo_angular = np.sign(delta_ra_deg)
+
+    # Evita que una diferencia exactamente igual a cero produzca signo cero
+    signo_angular[signo_angular == 0.0] = 1.0
+
+    signed_angular_residual_deg = (
+        angular_residual_deg
+        * signo_angular
+    )
+
+    stars["apex_angular_residual_signed_deg"] = (
+        signed_angular_residual_deg
+    )
+
+    return ApexResult(
+        n_stars=len(stars),
+
+        apex_ra_deg=float(apex_icrs.ra.deg),
+        apex_dec_deg=float(apex_icrs.dec.deg),
+        antapex_ra_deg=float(antapex_icrs.ra.deg),
+        antapex_dec_deg=float(antapex_icrs.dec.deg),
+
+        apex_l_deg=float(apex_galactic.l.deg),
+        apex_b_deg=float(apex_galactic.b.deg),
+
+        vx_mean_kms=float(mean_velocity[0]),
+        vy_mean_kms=float(mean_velocity[1]),
+        vz_mean_kms=float(mean_velocity[2]),
+        speed_mean_kms=mean_speed,
+
+        sigma_vx_rms_kms=sigma_vx,
+        sigma_vy_rms_kms=sigma_vy,
+        sigma_vz_rms_kms=sigma_vz,
+        sigma_3d_rms_kms=sigma_3d,
+        sigma_1d_rms_kms=sigma_1d,
+
+        sigma_apex_rms_deg=sigma_apex_rms_deg,
+
+        apex_ra_bootstrap_std_deg=ra_bootstrap_std,
+        apex_dec_bootstrap_std_deg=dec_bootstrap_std,
+        apex_angular_bootstrap_rms_deg=angular_bootstrap_rms,
+
+        stars=stars,
+    )
