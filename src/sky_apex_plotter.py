@@ -1422,6 +1422,307 @@ def plot_pole_scar_belt(
     alpha=0.45,
     figsize=(15, 4),
     return_selected=False,
+    flag_col="manual_apex_member",
+    flag_color="red",
+    value_col=None,
+    value_colors=None,
+):
+    """
+    Grafica los polos estelares dentro de una franja de ±belt_deg
+    alrededor del círculo máximo definido por el ápex.
+
+    Los puntos con flag=True se muestran con un color distinto.
+    """
+
+    required = [
+        "pole_x_unit",
+        "pole_y_unit",
+        "pole_z_unit",
+    ]
+
+    missing = [col for col in required if col not in df.columns]
+
+    if missing:
+        raise ValueError(
+            f"Faltan las columnas necesarias: {missing}"
+        )
+
+    if flag_col not in df.columns:
+        raise ValueError(
+            f"No existe la columna de flag '{flag_col}'."
+        )
+
+    if value_col is not None and value_col not in df.columns:
+        raise ValueError(
+            f"No existe la columna de valores '{value_col}'."
+        )
+
+    if value_colors is None:
+        value_colors = {
+            0: "tab:blue",
+            -1: "tab:orange",
+        }
+
+    # ----------------------------------------------------------
+    # 1. Extraer los polos unitarios
+    # ----------------------------------------------------------
+    poles_all = df[required].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
+    valid_mask = np.all(
+        np.isfinite(poles_all),
+        axis=1,
+    )
+
+    poles = poles_all[valid_mask]
+
+    if poles.shape[0] == 0:
+        raise ValueError(
+            "No hay polos finitos en el DataFrame."
+        )
+
+    # Extraer la flag siguiendo la misma máscara
+    flag_all = (
+        df[flag_col]
+        .fillna(False)
+        .astype(bool)
+        .to_numpy()
+    )
+
+    flag_valid = flag_all[valid_mask]
+
+    value_valid = None
+    if value_col is not None:
+        value_all = df[value_col].to_numpy()
+        value_valid = value_all[valid_mask]
+
+    # Renormalización de seguridad
+    norms = np.linalg.norm(poles, axis=1)
+
+    norm_valid = (
+        np.isfinite(norms)
+        & (norms > 0)
+    )
+
+    poles = poles[norm_valid]
+    poles = poles / norms[norm_valid, None]
+
+    # Aplicar también esta máscara a la flag
+    flag_valid = flag_valid[norm_valid]
+
+    if value_valid is not None:
+        value_valid = value_valid[norm_valid]
+
+    # Índices originales correspondientes
+    original_positions = np.flatnonzero(valid_mask)
+    original_positions = original_positions[norm_valid]
+
+    # ----------------------------------------------------------
+    # 2. Vector unitario del ápex
+    # ----------------------------------------------------------
+    ra_apex = np.radians(apex_ra_deg)
+    dec_apex = np.radians(apex_dec_deg)
+
+    apex_vector = np.array([
+        np.cos(dec_apex) * np.cos(ra_apex),
+        np.cos(dec_apex) * np.sin(ra_apex),
+        np.sin(dec_apex),
+    ])
+
+    apex_vector /= np.linalg.norm(apex_vector)
+
+    # ----------------------------------------------------------
+    # 3. Base ortonormal dentro del plano del círculo máximo
+    # ----------------------------------------------------------
+    reference = np.array([0.0, 0.0, 1.0])
+
+    if abs(np.dot(reference, apex_vector)) > 0.95:
+        reference = np.array([1.0, 0.0, 0.0])
+
+    axis_x = np.cross(reference, apex_vector)
+    axis_x /= np.linalg.norm(axis_x)
+
+    axis_y = np.cross(apex_vector, axis_x)
+    axis_y /= np.linalg.norm(axis_y)
+
+    # ----------------------------------------------------------
+    # 4. Coordenadas rectificadas
+    # ----------------------------------------------------------
+    projection_x = poles @ axis_x
+    projection_y = poles @ axis_y
+    projection_normal = poles @ apex_vector
+
+    longitude_along_belt_deg = np.degrees(
+        np.arctan2(
+            projection_y,
+            projection_x,
+        )
+    )
+
+    pole_residual_deg = np.degrees(
+        np.arcsin(
+            np.clip(
+                projection_normal,
+                -1.0,
+                1.0,
+            )
+        )
+    )
+
+    # ----------------------------------------------------------
+    # 5. Selección del cinturón ±belt_deg
+    # ----------------------------------------------------------
+    belt_mask = np.abs(pole_residual_deg) <= belt_deg
+
+    lon_belt = longitude_along_belt_deg[belt_mask]
+    residual_belt = pole_residual_deg[belt_mask]
+
+    # Flag solamente para los puntos dentro del cinturón
+    flag_belt = flag_valid[belt_mask]
+
+    value_belt = None
+    if value_valid is not None:
+        value_belt = value_valid[belt_mask]
+
+    # ----------------------------------------------------------
+    # 6. Gráfica
+    # ----------------------------------------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Todos los puntos en negro
+    ax.scatter(
+        lon_belt,
+        residual_belt,
+        s=point_size,
+        c="black",
+        alpha=alpha,
+        marker=".",
+        linewidths=0,
+        rasterized=True,
+        zorder=1,
+    )
+
+    # Puntos con flag=True en otro color
+    ax.scatter(
+        lon_belt[flag_belt],
+        residual_belt[flag_belt],
+        s=point_size,
+        c=flag_color,
+        alpha=alpha,
+        marker=".",
+        linewidths=0,
+        rasterized=True,
+        zorder=2,
+    )
+
+    if value_belt is not None:
+        for value in sorted({int(v) for v in value_belt if pd.notna(v)}):
+            if value not in value_colors:
+                continue
+            mask_value = value_belt == value
+            ax.scatter(
+                lon_belt[mask_value],
+                residual_belt[mask_value],
+                s=point_size,
+                c=value_colors[value],
+                alpha=alpha,
+                marker=".",
+                linewidths=0,
+                rasterized=True,
+                zorder=3,
+            )
+
+    ax.axhline(
+        0.0,
+        color="black",
+        linestyle="--",
+        linewidth=0.8,
+        alpha=0.8,
+    )
+
+    ax.set_xlim(-180.0, 180.0)
+    ax.set_ylim(-belt_deg, belt_deg)
+
+    ax.set_xlabel(
+        "Posición a lo largo del círculo máximo [deg]"
+    )
+
+    ax.set_ylabel(
+        "Distancia angular al círculo máximo [deg]"
+    )
+
+    ax.set_title(
+        f"Cinturón de polos: ±{belt_deg:.2f}° alrededor del círculo máximo\n"
+        f"N total válido = {len(poles):,}   |   "
+        f"N en cinturón = {belt_mask.sum():,}   |   "
+        f"flag=True = {flag_belt.sum():,}   |   "
+        f"fracción = {belt_mask.mean():.4f}"
+    )
+
+    ax.grid(
+        color="0.85",
+        linewidth=0.5,
+        alpha=0.7,
+    )
+
+    plt.tight_layout()
+
+    # ----------------------------------------------------------
+    # 7. Máscara en el tamaño original del DataFrame
+    # ----------------------------------------------------------
+    original_belt_mask = np.zeros(
+        len(df),
+        dtype=bool,
+    )
+
+    original_belt_positions = original_positions[belt_mask]
+    original_belt_mask[original_belt_positions] = True
+
+    result = {
+        "fig": fig,
+        "ax": ax,
+        "apex_vector": apex_vector,
+        "longitude_along_belt_deg": longitude_along_belt_deg,
+        "pole_residual_deg": pole_residual_deg,
+        "belt_mask_valid": belt_mask,
+        "belt_mask_dataframe": original_belt_mask,
+        "flag_belt": flag_belt,
+        "value_belt": value_belt,
+        "n_valid": len(poles),
+        "n_in_belt": int(belt_mask.sum()),
+        "n_flagged_in_belt": int(flag_belt.sum()),
+        "fraction_in_belt": float(belt_mask.mean()),
+    }
+
+    if return_selected:
+        result["df_belt"] = df.loc[
+            original_belt_mask
+        ].copy()
+
+    return result
+
+def plot_pole_scar_belt_cut(
+    df,
+    apex_ra_deg,
+    apex_dec_deg,
+    belt_deg=1.0,
+    point_size=0.35,
+    alpha=0.45,
+    figsize=(15, 4),
+    return_selected=False,
+    # --- nuevo ---
+    line1=None,                 # (m1, b1)
+    line2=None,                 # (m2, b2)
+    flag_color="red",
+    line_color="tab:blue",
+    line_style="-",
+    line_width=1.2,
+    line_alpha=0.9,
+    fill_between_lines=False,
+    fill_color="tab:blue",
+    fill_alpha=0.08,
 ):
     """
     Grafica los polos estelares dentro de una franja de ±belt_deg
@@ -1429,6 +1730,10 @@ def plot_pole_scar_belt(
 
     El círculo máximo se rectifica para aparecer como una línea
     horizontal en residual angular = 0 deg.
+
+    Si se pasan line1=(m1,b1) y line2=(m2,b2), ambas rectas se
+    dibujan en el espacio rectificado y los puntos que queden entre
+    ellas se resaltan con otro color.
 
     Parameters
     ----------
@@ -1457,6 +1762,19 @@ def plot_pole_scar_belt(
     return_selected : bool
         Si es True, devuelve también las filas que caen dentro
         del cinturón.
+
+    line1, line2 : tuple or None
+        Cada una debe ser (pendiente, intercepto), es decir (m, b),
+        para una recta y = m*x + b en el espacio rectificado.
+
+    flag_color : str
+        Color de los puntos entre las dos rectas.
+
+    line_color : str
+        Color de las rectas.
+
+    fill_between_lines : bool
+        Si es True, rellena visualmente la región entre ambas rectas.
 
     Returns
     -------
@@ -1530,11 +1848,8 @@ def plot_pole_scar_belt(
     # ----------------------------------------------------------
     # 3. Base ortonormal dentro del plano del círculo máximo
     # ----------------------------------------------------------
-    # Intentamos usar el polo celeste como referencia.
     reference = np.array([0.0, 0.0, 1.0])
 
-    # Si el ápex está casi alineado con el polo celeste,
-    # cambiamos el vector de referencia.
     if abs(np.dot(reference, apex_vector)) > 0.95:
         reference = np.array([1.0, 0.0, 0.0])
 
@@ -1579,10 +1894,44 @@ def plot_pole_scar_belt(
     residual_belt = pole_residual_deg[belt_mask]
 
     # ----------------------------------------------------------
-    # 6. Gráfica en blanco y negro
+    # 6. Selección entre dos rectas (si fueron dadas)
+    # ----------------------------------------------------------
+    points_between_lines = np.zeros(
+        len(lon_belt),
+        dtype=bool,
+    )
+
+    line_x = np.linspace(-180.0, 180.0, 1000)
+
+    y1_line = None
+    y2_line = None
+
+    if (line1 is not None) and (line2 is not None):
+        m1, b1 = line1
+        m2, b2 = line2
+
+        # Rectas dibujadas
+        y1_line = m1 * line_x + b1
+        y2_line = m2 * line_x + b2
+
+        # Valor de ambas rectas en la x de cada punto
+        y1_points = m1 * lon_belt + b1
+        y2_points = m2 * lon_belt + b2
+
+        y_lower = np.minimum(y1_points, y2_points)
+        y_upper = np.maximum(y1_points, y2_points)
+
+        points_between_lines = (
+            (residual_belt >= y_lower)
+            & (residual_belt <= y_upper)
+        )
+
+    # ----------------------------------------------------------
+    # 7. Gráfica
     # ----------------------------------------------------------
     fig, ax = plt.subplots(figsize=figsize)
 
+    # Todos los puntos en negro
     ax.scatter(
         lon_belt,
         residual_belt,
@@ -1592,7 +1941,52 @@ def plot_pole_scar_belt(
         marker=".",
         linewidths=0,
         rasterized=True,
+        zorder=1,
     )
+
+    # Puntos entre las rectas en otro color
+    if (line1 is not None) and (line2 is not None):
+        ax.scatter(
+            lon_belt[points_between_lines],
+            residual_belt[points_between_lines],
+            s=point_size,
+            c=flag_color,
+            alpha=alpha,
+            marker=".",
+            linewidths=0,
+            rasterized=True,
+            zorder=2,
+        )
+
+        if fill_between_lines:
+            ax.fill_between(
+                line_x,
+                y1_line,
+                y2_line,
+                color=fill_color,
+                alpha=fill_alpha,
+                zorder=0,
+            )
+
+        ax.plot(
+            line_x,
+            y1_line,
+            color=line_color,
+            linestyle=line_style,
+            linewidth=line_width,
+            alpha=line_alpha,
+            zorder=3,
+        )
+
+        ax.plot(
+            line_x,
+            y2_line,
+            color=line_color,
+            linestyle=line_style,
+            linewidth=line_width,
+            alpha=line_alpha,
+            zorder=3,
+        )
 
     ax.axhline(
         0.0,
@@ -1600,6 +1994,7 @@ def plot_pole_scar_belt(
         linestyle="--",
         linewidth=0.8,
         alpha=0.8,
+        zorder=4,
     )
 
     ax.set_xlim(-180.0, 180.0)
@@ -1613,12 +2008,17 @@ def plot_pole_scar_belt(
         "Distancia angular al círculo máximo [deg]"
     )
 
-    ax.set_title(
+    title = (
         f"Cinturón de polos: ±{belt_deg:.2f}° alrededor del círculo máximo\n"
         f"N total válido = {len(poles):,}   |   "
         f"N en cinturón = {belt_mask.sum():,}   |   "
         f"fracción = {belt_mask.mean():.4f}"
     )
+
+    if (line1 is not None) and (line2 is not None):
+        title += f"   |   N entre rectas = {points_between_lines.sum():,}"
+
+    ax.set_title(title)
 
     ax.grid(
         color="0.85",
@@ -1629,7 +2029,7 @@ def plot_pole_scar_belt(
     plt.tight_layout()
 
     # ----------------------------------------------------------
-    # 7. Máscara en el tamaño original del DataFrame
+    # 8. Máscaras en el tamaño original del DataFrame
     # ----------------------------------------------------------
     original_belt_mask = np.zeros(
         len(df),
@@ -1639,6 +2039,19 @@ def plot_pole_scar_belt(
     original_belt_positions = original_positions[belt_mask]
     original_belt_mask[original_belt_positions] = True
 
+    original_between_lines_mask = np.zeros(
+        len(df),
+        dtype=bool,
+    )
+
+    if (line1 is not None) and (line2 is not None):
+        original_between_positions = original_belt_positions[
+            points_between_lines
+        ]
+        original_between_lines_mask[
+            original_between_positions
+        ] = True
+
     result = {
         "fig": fig,
         "ax": ax,
@@ -1647,14 +2060,20 @@ def plot_pole_scar_belt(
         "pole_residual_deg": pole_residual_deg,
         "belt_mask_valid": belt_mask,
         "belt_mask_dataframe": original_belt_mask,
+        "between_lines_mask_dataframe": original_between_lines_mask,
         "n_valid": len(poles),
         "n_in_belt": int(belt_mask.sum()),
+        "n_between_lines": int(points_between_lines.sum()),
         "fraction_in_belt": float(belt_mask.mean()),
     }
 
     if return_selected:
         result["df_belt"] = df.loc[
             original_belt_mask
+        ].copy()
+
+        result["df_between_lines"] = df.loc[
+            original_between_lines_mask
         ].copy()
 
     return result

@@ -4644,3 +4644,284 @@ def calcular_apex_3d_gaia(
 
         stars=stars,
     )
+
+def manual_apex_to_vector(
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+) -> np.ndarray:
+    """
+    Convierte el ápex escrito manualmente, en RA y Dec,
+    a un vector unitario cartesiano ICRS.
+    """
+    ra_rad = np.deg2rad(apex_ra_deg)
+    dec_rad = np.deg2rad(apex_dec_deg)
+
+    apex_vector = np.array(
+        [
+            np.cos(dec_rad) * np.cos(ra_rad),
+            np.cos(dec_rad) * np.sin(ra_rad),
+            np.sin(dec_rad),
+        ],
+        dtype=float,
+    )
+
+    return apex_vector / np.linalg.norm(apex_vector)
+
+
+def flag_stars_from_manual_apex(
+    df: pd.DataFrame,
+    apex_ra_deg: float,
+    apex_dec_deg: float,
+    n_sigma: float = 3.0,
+    max_iterations: int = 50,
+    robust: bool = True,
+    min_sources: int = 3,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Recalcula los residuos angulares desde cero respecto al ápex
+    introducido manualmente y aplica sigma clipping iterativo.
+
+    No elimina estrellas. Añade flags al DataFrame.
+    """
+
+    result = df.copy()
+
+    pole_columns = [
+        "pole_x_unit",
+        "pole_y_unit",
+        "pole_z_unit",
+    ]
+
+    missing = [
+        column for column in pole_columns
+        if column not in result.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Faltan las columnas: {', '.join(missing)}"
+        )
+
+    # ---------------------------------------------------------
+    # 1. Construir exclusivamente el ápex escrito manualmente
+    # ---------------------------------------------------------
+    manual_apex_vector = manual_apex_to_vector(
+        apex_ra_deg=apex_ra_deg,
+        apex_dec_deg=apex_dec_deg,
+    )
+
+    # ---------------------------------------------------------
+    # 2. Leer y normalizar los polos
+    # ---------------------------------------------------------
+    poles = result[pole_columns].to_numpy(dtype=float)
+
+    valid = np.all(np.isfinite(poles), axis=1)
+
+    pole_norms = np.linalg.norm(poles, axis=1)
+
+    valid &= (
+        np.isfinite(pole_norms)
+        & (pole_norms > 0.0)
+    )
+
+    normalized_poles = np.full_like(
+        poles,
+        np.nan,
+        dtype=float,
+    )
+
+    normalized_poles[valid] = (
+        poles[valid]
+        / pole_norms[valid, None]
+    )
+
+    # ---------------------------------------------------------
+    # 3. Recalcular los residuos respecto al nuevo ápex
+    # ---------------------------------------------------------
+    dot_products = np.full(
+        len(result),
+        np.nan,
+        dtype=float,
+    )
+
+    dot_products[valid] = (
+        normalized_poles[valid]
+        @ manual_apex_vector
+    )
+
+    residuals_rad = np.full(
+        len(result),
+        np.nan,
+        dtype=float,
+    )
+
+    residuals_rad[valid] = np.arcsin(
+        np.clip(
+            np.abs(dot_products[valid]),
+            0.0,
+            1.0,
+        )
+    )
+
+    residuals_deg = np.rad2deg(residuals_rad)
+
+    # Estas columnas siempre corresponden al ápex manual actual.
+    result["manual_apex_ra_deg"] = apex_ra_deg
+    result["manual_apex_dec_deg"] = apex_dec_deg
+    result["manual_apex_residual_deg"] = residuals_deg
+
+    # ---------------------------------------------------------
+    # 4. Sigma clipping iterativo
+    # ---------------------------------------------------------
+    active = valid.copy()
+
+    result["manual_apex_member"] = False
+    result["manual_apex_clip_iteration"] = -1
+
+    center = np.nan
+    sigma = np.nan
+    upper_limit = np.nan
+    converged = False
+    completed_iterations = 0
+
+    for iteration in range(1, max_iterations + 1):
+
+        completed_iterations = iteration
+
+        current_residuals = residuals_deg[active]
+
+        if current_residuals.size < min_sources:
+            break
+
+        if robust:
+            center = np.median(current_residuals)
+
+            mad = np.median(
+                np.abs(current_residuals - center)
+            )
+
+            sigma = 1.4826 * mad
+
+        else:
+            center = np.mean(current_residuals)
+            sigma = np.std(
+                current_residuals,
+                ddof=1,
+            )
+
+        if not np.isfinite(sigma):
+            break
+
+        if np.isclose(sigma, 0.0):
+            converged = True
+            break
+
+        upper_limit = center + n_sigma * sigma
+
+        new_active = (
+            valid
+            & (residuals_deg <= upper_limit)
+        )
+
+        rejected_this_iteration = (
+            active
+            & ~new_active
+        )
+
+        result.loc[
+            rejected_this_iteration,
+            "manual_apex_clip_iteration",
+        ] = iteration
+
+        if np.array_equal(new_active, active):
+            active = new_active
+            converged = True
+            break
+
+        active = new_active
+
+    result.loc[
+        active,
+        "manual_apex_member",
+    ] = True
+
+    result.loc[
+        active,
+        "manual_apex_clip_iteration",
+    ] = 0
+
+    # ---------------------------------------------------------
+    # 5. Recalcular estadísticas finales del ápex manual
+    # ---------------------------------------------------------
+    final_residuals = residuals_deg[active]
+
+    if final_residuals.size > 0:
+
+        # RMS calculado ahora respecto al ápex manual.
+        manual_apex_rms_deg = np.sqrt(
+            np.mean(final_residuals**2)
+        )
+
+        manual_apex_mean_residual_deg = np.mean(
+            final_residuals
+        )
+
+        manual_apex_median_residual_deg = np.median(
+            final_residuals
+        )
+
+    else:
+        manual_apex_rms_deg = np.nan
+        manual_apex_mean_residual_deg = np.nan
+        manual_apex_median_residual_deg = np.nan
+
+    summary = {
+        "manual_apex_ra_deg": float(apex_ra_deg),
+        "manual_apex_dec_deg": float(apex_dec_deg),
+        "manual_apex_vector": manual_apex_vector,
+        "n_sigma": float(n_sigma),
+        "robust": bool(robust),
+        "n_total": int(len(result)),
+        "n_valid_poles": int(valid.sum()),
+        "n_accepted": int(active.sum()),
+        "n_rejected": int(valid.sum() - active.sum()),
+        "n_invalid": int((~valid).sum()),
+        "final_center_deg": (
+            float(center)
+            if np.isfinite(center)
+            else np.nan
+        ),
+        "final_sigma_deg": (
+            float(sigma)
+            if np.isfinite(sigma)
+            else np.nan
+        ),
+        "final_upper_limit_deg": (
+            float(upper_limit)
+            if np.isfinite(upper_limit)
+            else np.nan
+        ),
+        "manual_apex_rms_deg": (
+            float(manual_apex_rms_deg)
+            if np.isfinite(manual_apex_rms_deg)
+            else np.nan
+        ),
+        "manual_apex_mean_residual_deg": (
+            float(manual_apex_mean_residual_deg)
+            if np.isfinite(
+                manual_apex_mean_residual_deg
+            )
+            else np.nan
+        ),
+        "manual_apex_median_residual_deg": (
+            float(manual_apex_median_residual_deg)
+            if np.isfinite(
+                manual_apex_median_residual_deg
+            )
+            else np.nan
+        ),
+        "converged": bool(converged),
+        "iterations": int(completed_iterations),
+    }
+
+    return result, summary
