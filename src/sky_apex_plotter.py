@@ -787,6 +787,400 @@ def _plot_sphere_interactive(
 
     return fig
 
+from scipy.ndimage import gaussian_filter
+
+
+def plot_pole_density_from_dataframe(
+    df,
+    n_lon=720,
+    n_lat=360,
+    smoothing=1.5,
+    background_smoothing=15,
+    enhance_ridges=True,
+    percentile=99.7,
+    cmap="inferno",
+):
+    """
+    Grafica la densidad de polos utilizando pole_x_unit,
+    pole_y_unit y pole_z_unit.
+
+    Está diseñada para DataFrames grandes: no genera un scatter
+    con todos los puntos, sino una imagen rasterizada.
+    """
+
+    required_columns = [
+        "pole_x_unit",
+        "pole_y_unit",
+        "pole_z_unit",
+    ]
+
+    missing = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
+
+    if missing:
+        raise ValueError(
+            f"Faltan columnas necesarias: {missing}"
+        )
+
+    # copy=False evita una copia cuando pandas lo permite
+    x = df["pole_x_unit"].to_numpy(
+        dtype=np.float32,
+        copy=False,
+    )
+    y = df["pole_y_unit"].to_numpy(
+        dtype=np.float32,
+        copy=False,
+    )
+    z = df["pole_z_unit"].to_numpy(
+        dtype=np.float32,
+        copy=False,
+    )
+
+    valid = (
+        np.isfinite(x)
+        & np.isfinite(y)
+        & np.isfinite(z)
+    )
+
+    x = x[valid]
+    y = y[valid]
+    z = z[valid]
+
+    if x.size == 0:
+        raise ValueError(
+            "No hay polos válidos para graficar."
+        )
+
+    # Protección frente a pequeños errores numéricos
+    z = np.clip(z, -1.0, 1.0)
+
+    # Coordenadas esféricas de los polos
+    pole_lon = np.degrees(np.arctan2(y, x))
+    pole_lat = np.degrees(np.arcsin(z))
+
+    lon_edges = np.linspace(
+        -180.0,
+        180.0,
+        n_lon + 1,
+        dtype=np.float32,
+    )
+
+    lat_edges = np.linspace(
+        -90.0,
+        90.0,
+        n_lat + 1,
+        dtype=np.float32,
+    )
+
+    # histogram2d recibe primero y, luego x
+    density, _, _ = np.histogram2d(
+        pole_lat,
+        pole_lon,
+        bins=[lat_edges, lon_edges],
+    )
+
+    density = density.astype(
+        np.float32,
+        copy=False,
+    )
+
+    # Suavizado a pequeña escala
+    density_small = gaussian_filter(
+        density,
+        sigma=smoothing,
+        mode=("nearest", "wrap"),
+    )
+
+    if enhance_ridges:
+        # Fondo de gran escala
+        density_background = gaussian_filter(
+            density,
+            sigma=background_smoothing,
+            mode=("nearest", "wrap"),
+        )
+
+        # Resalta bandas o cicatrices
+        image = density_small - density_background
+        image[image < 0] = 0
+    else:
+        image = density_small
+
+    image_log = np.log1p(image)
+
+    positive = image_log[image_log > 0]
+
+    if positive.size > 0:
+        vmax = np.percentile(
+            positive,
+            percentile,
+        )
+    else:
+        vmax = 1.0
+
+    lon_centers = 0.5 * (
+        lon_edges[:-1] + lon_edges[1:]
+    )
+    lat_centers = 0.5 * (
+        lat_edges[:-1] + lat_edges[1:]
+    )
+
+    lon_grid, lat_grid = np.meshgrid(
+        np.radians(lon_centers),
+        np.radians(lat_centers),
+    )
+
+    fig = plt.figure(figsize=(14, 7))
+
+    ax = fig.add_subplot(
+        111,
+        projection="mollweide",
+    )
+
+    mesh = ax.pcolormesh(
+        lon_grid,
+        lat_grid,
+        image_log,
+        shading="auto",
+        cmap=cmap,
+        vmin=0,
+        vmax=vmax,
+        rasterized=True,
+    )
+
+    ax.grid(
+        color="white",
+        alpha=0.20,
+        linewidth=0.5,
+    )
+
+    if enhance_ridges:
+        title = (
+            "Crestas de densidad en el espacio de polos"
+        )
+    else:
+        title = "Densidad de polos"
+
+    ax.set_title(title, pad=18)
+
+    colorbar = fig.colorbar(
+        mesh,
+        ax=ax,
+        orientation="horizontal",
+        pad=0.08,
+        fraction=0.05,
+    )
+
+    colorbar.set_label(
+        r"$\log(1 + \mathrm{densidad})$"
+    )
+
+    plt.tight_layout()
+
+    return {
+        "fig": fig,
+        "ax": ax,
+        "density": density,
+        "image": image,
+        "pole_lon_deg": pole_lon,
+        "pole_lat_deg": pole_lat,
+        "valid_mask": valid,
+    }
+
+def fit_great_circle_and_straighten(
+    df,
+    n_lon=720,
+    n_lat=240,
+    lat_limit=30.0,
+    smoothing=1.5,
+    percentile=99.7,
+):
+    """
+    Ajusta un círculo máximo a los polos y rota el sistema para que
+    dicho círculo aparezca como una línea horizontal en latitud = 0.
+
+    Requiere:
+        pole_x_unit, pole_y_unit, pole_z_unit
+    """
+
+    cols = ["pole_x_unit", "pole_y_unit", "pole_z_unit"]
+
+    xyz = df[cols].to_numpy(dtype=np.float64, copy=False)
+
+    valid = np.all(np.isfinite(xyz), axis=1)
+    xyz = xyz[valid]
+
+    if len(xyz) < 3:
+        raise ValueError("No hay suficientes polos válidos.")
+
+    # Renormalizar por seguridad
+    norms = np.linalg.norm(xyz, axis=1)
+    good_norm = norms > 0
+
+    xyz = xyz[good_norm]
+    xyz = xyz / norms[good_norm, None]
+
+    # ------------------------------------------------------------
+    # 1. Ajuste del plano mediante SVD
+    #
+    # El vector singular asociado al menor valor singular es
+    # la normal del plano que mejor contiene los polos.
+    # ------------------------------------------------------------
+    _, singular_values, vh = np.linalg.svd(
+        xyz,
+        full_matrices=False,
+    )
+
+    plane_normal = vh[-1]
+    plane_normal /= np.linalg.norm(plane_normal)
+
+    # ------------------------------------------------------------
+    # 2. Construir una base ortonormal rotada
+    #
+    # z_new = normal del plano
+    # x_new, y_new = ejes dentro del plano
+    # ------------------------------------------------------------
+    z_new = plane_normal
+
+    reference = np.array([0.0, 0.0, 1.0])
+
+    # Evitar que el vector de referencia sea paralelo a z_new
+    if np.abs(np.dot(reference, z_new)) > 0.9:
+        reference = np.array([1.0, 0.0, 0.0])
+
+    x_new = np.cross(reference, z_new)
+    x_new /= np.linalg.norm(x_new)
+
+    y_new = np.cross(z_new, x_new)
+    y_new /= np.linalg.norm(y_new)
+
+    # Proyecciones en el sistema rotado
+    x_rot = xyz @ x_new
+    y_rot = xyz @ y_new
+    z_rot = xyz @ z_new
+
+    # Coordenadas angulares rotadas
+    lon_rot = np.degrees(
+        np.arctan2(y_rot, x_rot)
+    )
+
+    lat_rot = np.degrees(
+        np.arcsin(np.clip(z_rot, -1.0, 1.0))
+    )
+
+    # ------------------------------------------------------------
+    # 3. Histograma 2D
+    # ------------------------------------------------------------
+    lon_edges = np.linspace(
+        -180.0,
+        180.0,
+        n_lon + 1,
+    )
+
+    lat_edges = np.linspace(
+        -lat_limit,
+        lat_limit,
+        n_lat + 1,
+    )
+
+    density, _, _ = np.histogram2d(
+        lat_rot,
+        lon_rot,
+        bins=[lat_edges, lon_edges],
+    )
+
+    density = density.astype(np.float32)
+
+    if smoothing > 0:
+        density = gaussian_filter(
+            density,
+            sigma=(smoothing, smoothing),
+            mode=("nearest", "wrap"),
+        )
+
+    image = np.log1p(density)
+
+    positive = image[image > 0]
+
+    vmax = (
+        np.percentile(positive, percentile)
+        if positive.size > 0
+        else 1.0
+    )
+
+    # ------------------------------------------------------------
+    # 4. Gráfica rectangular
+    # ------------------------------------------------------------
+    fig, ax = plt.subplots(
+        figsize=(14, 6),
+    )
+
+    extent = [
+        -180.0,
+        180.0,
+        -lat_limit,
+        lat_limit,
+    ]
+
+    im = ax.imshow(
+        image,
+        origin="lower",
+        extent=extent,
+        aspect="auto",
+        cmap="inferno",
+        vmin=0,
+        vmax=vmax,
+        interpolation="nearest",
+        rasterized=True,
+    )
+
+    # Línea del círculo máximo ajustado
+    ax.axhline(
+        0.0,
+        color="cyan",
+        linewidth=1.5,
+        linestyle="--",
+        label="Círculo máximo ajustado",
+    )
+
+    ax.set_xlabel(
+        "Longitud en el sistema rotado [deg]"
+    )
+
+    ax.set_ylabel(
+        "Distancia angular al círculo máximo [deg]"
+    )
+
+    ax.set_title(
+        "Espacio de polos rectificado"
+    )
+
+    ax.legend(loc="upper right")
+
+    cbar = fig.colorbar(
+        im,
+        ax=ax,
+        pad=0.02,
+    )
+
+    cbar.set_label(
+        r"$\log(1 + N)$"
+    )
+
+    plt.tight_layout()
+
+    return {
+        "fig": fig,
+        "ax": ax,
+        "plane_normal": plane_normal,
+        "singular_values": singular_values,
+        "lon_rot_deg": lon_rot,
+        "lat_rot_deg": lat_rot,
+        "density": density,
+        "valid_mask": valid,
+    }
+
 def plot_apex_lambda_experiment_sphere(
     experiment: Dict[str, Any],
     title: Optional[str] = None,
@@ -1018,3 +1412,249 @@ def plot_apex_lambda_experiment_sphere(
         fig.show()
 
     return fig
+
+def plot_pole_scar_belt(
+    df,
+    apex_ra_deg,
+    apex_dec_deg,
+    belt_deg=1.0,
+    point_size=0.35,
+    alpha=0.45,
+    figsize=(15, 4),
+    return_selected=False,
+):
+    """
+    Grafica los polos estelares dentro de una franja de ±belt_deg
+    alrededor del círculo máximo definido por el ápex.
+
+    El círculo máximo se rectifica para aparecer como una línea
+    horizontal en residual angular = 0 deg.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Debe contener:
+        pole_x_unit, pole_y_unit, pole_z_unit.
+
+    apex_ra_deg : float
+        Ascensión recta del ápex en grados.
+
+    apex_dec_deg : float
+        Declinación del ápex en grados.
+
+    belt_deg : float, default=1.0
+        Semiancho del cinturón alrededor del círculo máximo.
+
+    point_size : float
+        Tamaño de los puntos.
+
+    alpha : float
+        Transparencia de los puntos.
+
+    figsize : tuple
+        Tamaño de la figura.
+
+    return_selected : bool
+        Si es True, devuelve también las filas que caen dentro
+        del cinturón.
+
+    Returns
+    -------
+    result : dict
+        Diccionario con figura, ejes, coordenadas rectificadas,
+        máscaras y métricas básicas.
+    """
+
+    required = [
+        "pole_x_unit",
+        "pole_y_unit",
+        "pole_z_unit",
+    ]
+
+    missing = [col for col in required if col not in df.columns]
+
+    if missing:
+        raise ValueError(
+            f"Faltan las columnas necesarias: {missing}"
+        )
+
+    # ----------------------------------------------------------
+    # 1. Extraer los polos unitarios
+    # ----------------------------------------------------------
+    poles_all = df[required].to_numpy(
+        dtype=np.float64,
+        copy=False,
+    )
+
+    valid_mask = np.all(
+        np.isfinite(poles_all),
+        axis=1,
+    )
+
+    poles = poles_all[valid_mask]
+
+    if poles.shape[0] == 0:
+        raise ValueError(
+            "No hay polos finitos en el DataFrame."
+        )
+
+    # Renormalización de seguridad
+    norms = np.linalg.norm(poles, axis=1)
+
+    norm_valid = (
+        np.isfinite(norms)
+        & (norms > 0)
+    )
+
+    poles = poles[norm_valid]
+    poles = poles / norms[norm_valid, None]
+
+    # Índices originales correspondientes
+    original_positions = np.flatnonzero(valid_mask)
+    original_positions = original_positions[norm_valid]
+
+    # ----------------------------------------------------------
+    # 2. Vector unitario del ápex
+    # ----------------------------------------------------------
+    ra_apex = np.radians(apex_ra_deg)
+    dec_apex = np.radians(apex_dec_deg)
+
+    apex_vector = np.array([
+        np.cos(dec_apex) * np.cos(ra_apex),
+        np.cos(dec_apex) * np.sin(ra_apex),
+        np.sin(dec_apex),
+    ])
+
+    apex_vector /= np.linalg.norm(apex_vector)
+
+    # ----------------------------------------------------------
+    # 3. Base ortonormal dentro del plano del círculo máximo
+    # ----------------------------------------------------------
+    # Intentamos usar el polo celeste como referencia.
+    reference = np.array([0.0, 0.0, 1.0])
+
+    # Si el ápex está casi alineado con el polo celeste,
+    # cambiamos el vector de referencia.
+    if abs(np.dot(reference, apex_vector)) > 0.95:
+        reference = np.array([1.0, 0.0, 0.0])
+
+    axis_x = np.cross(reference, apex_vector)
+    axis_x /= np.linalg.norm(axis_x)
+
+    axis_y = np.cross(apex_vector, axis_x)
+    axis_y /= np.linalg.norm(axis_y)
+
+    # ----------------------------------------------------------
+    # 4. Coordenadas rectificadas
+    # ----------------------------------------------------------
+    projection_x = poles @ axis_x
+    projection_y = poles @ axis_y
+    projection_normal = poles @ apex_vector
+
+    # Coordenada a lo largo del círculo máximo
+    longitude_along_belt_deg = np.degrees(
+        np.arctan2(
+            projection_y,
+            projection_x,
+        )
+    )
+
+    # Distancia angular firmada al círculo máximo
+    pole_residual_deg = np.degrees(
+        np.arcsin(
+            np.clip(
+                projection_normal,
+                -1.0,
+                1.0,
+            )
+        )
+    )
+
+    # ----------------------------------------------------------
+    # 5. Selección del cinturón ±belt_deg
+    # ----------------------------------------------------------
+    belt_mask = np.abs(pole_residual_deg) <= belt_deg
+
+    lon_belt = longitude_along_belt_deg[belt_mask]
+    residual_belt = pole_residual_deg[belt_mask]
+
+    # ----------------------------------------------------------
+    # 6. Gráfica en blanco y negro
+    # ----------------------------------------------------------
+    fig, ax = plt.subplots(figsize=figsize)
+
+    ax.scatter(
+        lon_belt,
+        residual_belt,
+        s=point_size,
+        c="black",
+        alpha=alpha,
+        marker=".",
+        linewidths=0,
+        rasterized=True,
+    )
+
+    ax.axhline(
+        0.0,
+        color="black",
+        linestyle="--",
+        linewidth=0.8,
+        alpha=0.8,
+    )
+
+    ax.set_xlim(-180.0, 180.0)
+    ax.set_ylim(-belt_deg, belt_deg)
+
+    ax.set_xlabel(
+        "Posición a lo largo del círculo máximo [deg]"
+    )
+
+    ax.set_ylabel(
+        "Distancia angular al círculo máximo [deg]"
+    )
+
+    ax.set_title(
+        f"Cinturón de polos: ±{belt_deg:.2f}° alrededor del círculo máximo\n"
+        f"N total válido = {len(poles):,}   |   "
+        f"N en cinturón = {belt_mask.sum():,}   |   "
+        f"fracción = {belt_mask.mean():.4f}"
+    )
+
+    ax.grid(
+        color="0.85",
+        linewidth=0.5,
+        alpha=0.7,
+    )
+
+    plt.tight_layout()
+
+    # ----------------------------------------------------------
+    # 7. Máscara en el tamaño original del DataFrame
+    # ----------------------------------------------------------
+    original_belt_mask = np.zeros(
+        len(df),
+        dtype=bool,
+    )
+
+    original_belt_positions = original_positions[belt_mask]
+    original_belt_mask[original_belt_positions] = True
+
+    result = {
+        "fig": fig,
+        "ax": ax,
+        "apex_vector": apex_vector,
+        "longitude_along_belt_deg": longitude_along_belt_deg,
+        "pole_residual_deg": pole_residual_deg,
+        "belt_mask_valid": belt_mask,
+        "belt_mask_dataframe": original_belt_mask,
+        "n_valid": len(poles),
+        "n_in_belt": int(belt_mask.sum()),
+        "fraction_in_belt": float(belt_mask.mean()),
+    }
+
+    if return_selected:
+        result["df_belt"] = df.loc[
+            original_belt_mask
+        ].copy()
+
+    return result

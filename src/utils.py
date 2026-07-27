@@ -4199,8 +4199,10 @@ def calcular_apex_3d_gaia(
     # Velocidad media y dirección del ápex
     # ------------------------------------------------------------------
     mean_velocity = weighted_mean_vector(velocity, weights)
+    all_velocity = velocity/ float(np.linalg.norm(mean_velocity))
     mean_speed = float(np.linalg.norm(mean_velocity))
 
+    apex_icrs_individual = np.array([vector_to_icrs(i) for i in all_velocity])
     apex_icrs = vector_to_icrs(mean_velocity)
     antapex_icrs = vector_to_icrs(-mean_velocity)
     apex_galactic = apex_icrs.transform_to(Galactic())
@@ -4608,6 +4610,9 @@ def calcular_apex_3d_gaia(
     stars["apex_angular_residual_signed_deg"] = (
         signed_angular_residual_deg
     )
+    
+    stars["apex_ra_deg"] = np.array([i.ra.deg for i in  apex_icrs_individual])
+    stars["apex_dec_deg"] = np.array([i.dec.deg for i in  apex_icrs_individual])
 
     return ApexResult(
         n_stars=len(stars),

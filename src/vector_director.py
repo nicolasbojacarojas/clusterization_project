@@ -1779,6 +1779,7 @@ def process_single_cluster(
     theta_clip_min_remaining: Optional[int] = None,
     theta_clip_apex_tolerance_deg: float = 1e-3,
     theta_clip_threshold_tolerance_deg: float = 1e-4,
+    compute_cross_product_poles: bool = True,
     true_apex_vector: Optional[np.ndarray] = None,
     true_apex_ra_deg: Optional[float] = None,
     true_apex_dec_deg: Optional[float] = None,
@@ -1878,19 +1879,21 @@ def process_single_cluster(
             * df_initial["distance_pc"]
         )
 
-    try:
-        cross_initial = apex_from_pole_cross_products(
-            df_initial,
-            reference_apex_vector=apex_initial["apex_vector"],
-            weight_col=effective_weight_col,
-            pole_norm_min=min_pole_norm,
-            min_sources=min_stars,
-        )
-    except ValueError as exc:
-        print(
-            f"Cluster {cluster_id}: cross-product initial apex failed - {exc}"
-        )
-        cross_initial = None
+    cross_initial = None
+    if compute_cross_product_poles:
+        try:
+            cross_initial = apex_from_pole_cross_products(
+                df_initial,
+                reference_apex_vector=apex_initial["apex_vector"],
+                weight_col=effective_weight_col,
+                pole_norm_min=min_pole_norm,
+                min_sources=min_stars,
+            )
+        except ValueError as exc:
+            print(
+                f"Cluster {cluster_id}: cross-product initial apex failed - {exc}"
+            )
+            cross_initial = None
 
     apex_initial_bootstrap_metrics = apex_bootstrap_stability_metrics(
         df=df_initial,
@@ -1977,19 +1980,21 @@ def process_single_cluster(
             * df_refined["distance_pc"]
         )
 
-    try:
-        cross_refined = apex_from_pole_cross_products(
-            df_refined,
-            reference_apex_vector=apex_refined["apex_vector"],
-            weight_col=effective_weight_col,
-            pole_norm_min=min_pole_norm,
-            min_sources=min_stars,
-        )
-    except ValueError as exc:
-        print(
-            f"Cluster {cluster_id}: cross-product refined apex failed - {exc}"
-        )
-        cross_refined = None
+    cross_refined = None
+    if compute_cross_product_poles:
+        try:
+            cross_refined = apex_from_pole_cross_products(
+                df_refined,
+                reference_apex_vector=apex_refined["apex_vector"],
+                weight_col=effective_weight_col,
+                pole_norm_min=min_pole_norm,
+                min_sources=min_stars,
+            )
+        except ValueError as exc:
+            print(
+                f"Cluster {cluster_id}: cross-product refined apex failed - {exc}"
+            )
+            cross_refined = None
 
 
     if "theta_pole_refined_deg" not in df_refined.columns:
@@ -2158,6 +2163,7 @@ def process_all_clusters(
     theta_clip_min_remaining: Optional[int] = None,
     theta_clip_apex_tolerance_deg: float = 1e-3,
     theta_clip_threshold_tolerance_deg: float = 1e-4,
+    compute_cross_product_poles: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Procesa todos los cluster_id presentes en el DataFrame.
@@ -2191,6 +2197,7 @@ def process_all_clusters(
             theta_clip_min_remaining=theta_clip_min_remaining,
             theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
             theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
+            compute_cross_product_poles=compute_cross_product_poles,
         )
 
         if cluster_result is not None:
@@ -2833,6 +2840,7 @@ def run_cluster_analysis_from_dataframe(
     theta_clip_min_remaining: Optional[int] = None,
     theta_clip_apex_tolerance_deg: float = 1e-3,
     theta_clip_threshold_tolerance_deg: float = 1e-4,
+    compute_cross_product_poles: bool = True,
 ) -> Dict[str, Any]:
     """
     Ejecuta el análisis completo desde un DataFrame de pandas ya cargado.
@@ -2897,6 +2905,7 @@ def run_cluster_analysis_from_dataframe(
             theta_clip_min_remaining=theta_clip_min_remaining,
             theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
             theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
+            compute_cross_product_poles=compute_cross_product_poles,
         )
 
         summary = (
@@ -2931,6 +2940,7 @@ def run_cluster_analysis_from_dataframe(
         theta_clip_min_remaining=theta_clip_min_remaining,
         theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
         theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
+        compute_cross_product_poles=compute_cross_product_poles,
     )
 
     summary_df = summarize_all_cluster_results(cluster_results)
@@ -3010,6 +3020,7 @@ def run_cluster_analysis(
         theta_clip_min_remaining=theta_clip_min_remaining,
         theta_clip_apex_tolerance_deg=theta_clip_apex_tolerance_deg,
         theta_clip_threshold_tolerance_deg=theta_clip_threshold_tolerance_deg,
+        compute_cross_product_poles=True,
     )
 
 
